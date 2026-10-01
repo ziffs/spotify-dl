@@ -39,6 +39,13 @@ fd-lock = "4"
 [dev-dependencies]
 tempfile = "3"
 
+[build-dependencies]
+# librespot-core's build script uses vergen-gitcl, which requires vergen-lib 0.1.x.
+# vergen 9.1.0 switched to vergen-lib 9.x, producing a trait mismatch in the
+# build script. Pin vergen so `cargo install` (which ignores Cargo.lock) cannot
+# select 9.1.0.
+vergen = { version = "=9.0.6", default-features = false }
+
 [features]
 default = ["mp3"]
 mp3 = ["dep:mp3lame-encoder"]

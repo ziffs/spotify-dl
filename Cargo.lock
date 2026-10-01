@@ -2845,6 +2845,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tryhard",
+ "vergen",
 ]
 
 [[package]]
