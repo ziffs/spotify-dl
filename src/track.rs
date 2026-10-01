@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use lazy_static::lazy_static;
-use librespot::core::session::Session;
 use librespot::core::SpotifyUri;
+use librespot::core::session::Session;
 use librespot::core::spotify_id::SpotifyId;
 use librespot::metadata::Metadata;
 use librespot::metadata::image::Image;
@@ -29,7 +29,9 @@ pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<V
         tracing::debug!("Getting tracks for: {}", id);
         let id = parse_uri_or_url(&id).ok_or(anyhow::anyhow!("Invalid track"))?;
         let new_tracks = match &id {
-            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => vec![Track::from_id(id.clone())],
+            SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
+                vec![Track::from_id(id.clone())]
+            }
             SpotifyUri::Album { .. } => Album::from_id(id.clone()).get_tracks(session).await,
             SpotifyUri::Playlist { .. } => Playlist::from_id(id.clone()).get_tracks(session).await,
             other => {
@@ -62,7 +64,10 @@ fn parse_uri(track_uri: &str) -> Option<SpotifyUri> {
         "track" => SpotifyUri::Track { id: sid },
         "episode" => SpotifyUri::Episode { id: sid },
         "album" => SpotifyUri::Album { id: sid },
-        "playlist" => SpotifyUri::Playlist { user: None, id: sid },
+        "playlist" => SpotifyUri::Playlist {
+            user: None,
+            id: sid,
+        },
         _ => return None,
     };
     tracing::info!("Parsed URI: {:?}", uri);
@@ -78,7 +83,10 @@ fn parse_url(track_url: &str) -> Option<SpotifyUri> {
         "track" => Some(SpotifyUri::Track { id: sid }),
         "episode" => Some(SpotifyUri::Episode { id: sid }),
         "album" => Some(SpotifyUri::Album { id: sid }),
-        "playlist" => Some(SpotifyUri::Playlist { user: None, id: sid }),
+        "playlist" => Some(SpotifyUri::Playlist {
+            user: None,
+            id: sid,
+        }),
         _ => None,
     }
 }
@@ -175,7 +183,10 @@ impl TrackCollection for Album {
         let album = librespot::metadata::Album::get(session, &self.id)
             .await
             .expect("Failed to get album");
-        album.tracks().map(|track| Track::from_id(track.clone())).collect()
+        album
+            .tracks()
+            .map(|track| Track::from_id(track.clone()))
+            .collect()
     }
 }
 
@@ -206,7 +217,10 @@ impl TrackCollection for Playlist {
         let playlist = librespot::metadata::Playlist::get(session, &self.id)
             .await
             .expect("Failed to get playlist");
-        playlist.tracks().map(|track| Track::from_id(track.clone())).collect()
+        playlist
+            .tracks()
+            .map(|track| Track::from_id(track.clone()))
+            .collect()
     }
 }
 

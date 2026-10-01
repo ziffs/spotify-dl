@@ -56,10 +56,14 @@ impl Stream {
                             track_id,
                             error
                         );
-                        Self::send_event(&tx, StreamEvent::Retry {
-                            attempt: attempt as usize,
-                            max_attempts: 3,
-                        }).await;
+                        Self::send_event(
+                            &tx,
+                            StreamEvent::Retry {
+                                attempt: attempt as usize,
+                                max_attempts: 3,
+                            },
+                        )
+                        .await;
                     }
                 })
                 .exponential_backoff(Duration::from_secs(10))

@@ -23,9 +23,16 @@ struct Opt {
     )]
     destination: Option<String>,
     #[structopt(
+        short = "f",
+        long = "format",
+        help = "The format to download the tracks in. Default is mp3.",
+        default_value = "mp3"
+    )]
+    format: Format,
+    #[structopt(
         short = "p",
         long = "playlist-file",
-        help = "Write all tracks into a playlist file.",
+        help = "Write all tracks into a playlist file."
     )]
     playlist_file: Option<String>,
     #[structopt(
@@ -37,10 +44,9 @@ struct Opt {
     #[structopt(
         short = "r",
         long = "rate-limit",
-        default_value = "true",
-        help = "Rate limit downloads to one track every minute"
+        help = "Don't rate limit downloads to one track every minute"
     )]
-    rate_limit: bool,
+    no_rate_limit: bool,
 }
 
 pub fn create_destination_if_required(destination: Option<String>) -> anyhow::Result<()> {
@@ -73,7 +79,13 @@ async fn main() -> anyhow::Result<()> {
     downloader
         .download_tracks(
             track,
-            &DownloadOptions::new(opt.destination, opt.parallel, opt.format, opt.force, opt.playlist_file, opt.rate_limit),
+            &DownloadOptions::new(
+                opt.destination,
+                opt.format,
+                opt.force,
+                opt.playlist_file,
+                !opt.no_rate_limit,
+            ),
         )
         .await
 }

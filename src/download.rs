@@ -4,8 +4,6 @@ use std::time::Duration;
 use tokio::time;
 
 use anyhow::Result;
-use futures::StreamExt;
-use futures::TryStreamExt;
 use indicatif::MultiProgress;
 use indicatif::ProgressBar;
 use indicatif::ProgressState;
@@ -36,7 +34,13 @@ pub struct DownloadOptions {
 }
 
 impl DownloadOptions {
-    pub fn new(destination: Option<String>, format: Format, force: bool, playlist_file: Option<String>,rate_limit: bool) -> Self {
+    pub fn new(
+        destination: Option<String>,
+        format: Format,
+        force: bool,
+        playlist_file: Option<String>,
+        rate_limit: bool,
+    ) -> Self {
         let destination =
             destination.map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
         DownloadOptions {
@@ -63,7 +67,7 @@ impl Downloader {
         options: &DownloadOptions,
     ) -> Result<()> {
         if options.rate_limit {
-        tracing::info!("Rate limiting enabled: downloading one track every minute");
+            tracing::info!("Rate limiting enabled: downloading one track every minute");
         }
 
         let mut filenames = Vec::new();
@@ -73,7 +77,7 @@ impl Downloader {
                 time::sleep(Duration::from_secs(60)).await;
             }
 
-            let filename = match self.download_track(&track, options, index).await {
+            let filename = match self.download_track(&track, options).await {
                 Err(err) => {
                     tracing::warn!("Error in track {:?}: {:?}", track.id, err);
                     "".to_string()
@@ -84,10 +88,12 @@ impl Downloader {
         }
 
         if let Some(playlist_file) = &options.playlist_file {
-            let content = filenames.iter()
+            let content = filenames
+                .iter()
                 .map(|s| s.clone())
                 .map(|s| format!("{}\n", s))
-                .collect::<Vec<String>>().join("");
+                .collect::<Vec<String>>()
+                .join("");
             tokio::fs::write(playlist_file, content).await?;
             tracing::info!("Wrote playlist file: {:?}", playlist_file);
         }
@@ -95,7 +101,7 @@ impl Downloader {
     }
 
     #[tracing::instrument(name = "download_track", skip(self))]
-    async fn download_track(&self, track: &Track, options: &DownloadOptions, index: Option<usize>) -> Result<String> {
+    async fn download_track(&self, track: &Track, options: &DownloadOptions) -> Result<String> {
         let metadata = track.metadata(&self.session).await?;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
 
@@ -114,7 +120,11 @@ impl Downloader {
                 "Skipping {}, file already exists. Use --force to force re-downloading the track",
                 &metadata.track_name
             );
-            let filename = PathBuf::from(&filename).with_extension(options.format.extension()).to_str().unwrap().to_string();
+            let filename = PathBuf::from(&filename)
+                .with_extension(options.format.extension())
+                .to_str()
+                .unwrap()
+                .to_string();
             return Ok(filename);
         }
 
@@ -228,7 +238,11 @@ impl Downloader {
         S: Into<String>,
     {
         tracing::error!("Failed to download {}: {}", name, e.into());
-        pb.finish_with_message(console::style(format!("Failed! {}", name)).red().to_string());
+        pb.finish_with_message(
+            console::style(format!("Failed! {}", name))
+                .red()
+                .to_string(),
+        );
     }
 }
 
