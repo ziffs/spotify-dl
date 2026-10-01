@@ -29,7 +29,7 @@ impl Stream {
         }
     }
 
-    pub async fn stream(&self, track: Track) -> Result<StreamEventChannel> {
+    pub async fn stream(&self, track: &Track) -> Result<StreamEventChannel> {
         let metadata = track.metadata(&self.session).await?;
         let (sink, mut channel) = ChannelSink::new(metadata);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -41,6 +41,7 @@ impl Stream {
             move || Box::new(sink),
         );
 
+        let track = track.clone();
         tokio::spawn(async move {
             match tryhard::retry_fn(|| async { Self::load(player.clone(), &track).await })
                 .retries(3)

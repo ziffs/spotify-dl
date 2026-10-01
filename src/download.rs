@@ -60,10 +60,13 @@ impl Downloader {
         options: &DownloadOptions,
     ) -> Result<()> {
         let total = tracks.len();
-        futures::stream::iter(tracks.into_iter().enumerate())
-            .map(|(i, track)| {
+        futures::stream::iter(tracks.iter().enumerate())
+            .map(async |(i, track)| {
                 let index = if total > 1 { Some(i + 1) } else { None };
-                self.download_track(track, options, index)
+                if let Err(err) = self.download_track(&track, options, index).await {
+                    tracing::warn!("Error in track {:?}: {:?}", track.id, err);
+                }
+                anyhow::Ok(())
             })
             .buffer_unordered(options.parallel)
             .try_collect::<Vec<_>>()
@@ -73,7 +76,7 @@ impl Downloader {
     }
 
     #[tracing::instrument(name = "download_track", skip(self))]
-    async fn download_track(&self, track: Track, options: &DownloadOptions, index: Option<usize>) -> Result<()> {
+    async fn download_track(&self, track: &Track, options: &DownloadOptions, index: Option<usize>) -> Result<()> {
         let metadata = track.metadata(&self.session).await?;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
 
