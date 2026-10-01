@@ -29,25 +29,17 @@ pub struct DownloadOptions {
     pub destination: PathBuf,
     pub format: Format,
     pub force: bool,
-    pub playlist_file: Option<String>,
     pub rate_limit: bool,
 }
 
 impl DownloadOptions {
-    pub fn new(
-        destination: Option<String>,
-        format: Format,
-        force: bool,
-        playlist_file: Option<String>,
-        rate_limit: bool,
-    ) -> Self {
+    pub fn new(destination: Option<String>, format: Format, force: bool, rate_limit: bool) -> Self {
         let destination =
             destination.map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
         DownloadOptions {
             destination,
             format,
             force,
-            playlist_file,
             rate_limit,
         }
     }
@@ -84,17 +76,31 @@ impl Downloader {
                 }
                 Ok(filename) => filename,
             };
-            filenames.push(filename);
+            filenames.push((track.source_playlist.clone(), filename));
         }
 
-        if let Some(playlist_file) = &options.playlist_file {
-            let content = filenames
-                .iter()
-                .map(|s| s.clone())
-                .map(|s| format!("{}\n", s))
-                .collect::<Vec<String>>()
-                .join("");
-            tokio::fs::write(playlist_file, content).await?;
+        let mut playlists: Vec<(String, Vec<String>)> = Vec::new();
+        for (source_playlist, filename) in filenames {
+            let Some(playlist) = source_playlist else {
+                continue;
+            };
+            if filename.is_empty() {
+                continue;
+            }
+            match playlists.iter_mut().find(|(name, _)| name == &playlist) {
+                Some((_, entries)) => entries.push(filename),
+                None => playlists.push((playlist, vec![filename])),
+            }
+        }
+
+        for (playlist, entries) in playlists {
+            let mut content = String::from("#EXTM3U\n");
+            for entry in entries {
+                content.push_str(&entry);
+                content.push('\n');
+            }
+            let playlist_file = options.destination.join(format!("{}.m3u", playlist));
+            tokio::fs::write(&playlist_file, content).await?;
             tracing::info!("Wrote playlist file: {:?}", playlist_file);
         }
         Ok(())
@@ -105,12 +111,14 @@ impl Downloader {
         let metadata = track.metadata(&self.session).await?;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
 
-        let filename = metadata.to_string();
-
+        let relative_path = format!(
+            "{}.{}",
+            metadata.to_path_string(),
+            options.format.extension()
+        );
         let path = options
             .destination
-            .join(&filename)
-            .with_extension(options.format.extension())
+            .join(&relative_path)
             .to_str()
             .ok_or(anyhow::anyhow!("Could not set the output path"))?
             .to_string();
@@ -120,12 +128,7 @@ impl Downloader {
                 "Skipping {}, file already exists. Use --force to force re-downloading the track",
                 &metadata.track_name
             );
-            let filename = PathBuf::from(&filename)
-                .with_extension(options.format.extension())
-                .to_str()
-                .unwrap()
-                .to_string();
-            return Ok(filename);
+            return Ok(relative_path);
         }
 
         let pb = self.add_progress_bar(&metadata);
@@ -165,7 +168,7 @@ impl Downloader {
         encoder::tags::store_tags(path, &tags, options.format).await?;
 
         pb.finish_with_message(format!("Downloaded {}", metadata.to_string()));
-        Ok("".to_string())
+        Ok(relative_path)
     }
 
     fn add_progress_bar(&self, track: &TrackMetadata) -> ProgressBar {

@@ -94,6 +94,7 @@ fn parse_url(track_url: &str) -> Option<SpotifyUri> {
 #[derive(Clone, Debug)]
 pub struct Track {
     pub id: SpotifyUri,
+    pub source_playlist: Option<String>,
 }
 
 lazy_static! {
@@ -104,11 +105,24 @@ lazy_static! {
 impl Track {
     pub fn new(track: &str) -> Result<Self> {
         let id = parse_uri_or_url(track).ok_or(anyhow::anyhow!("Invalid track"))?;
-        Ok(Track { id })
+        Ok(Track {
+            id,
+            source_playlist: None,
+        })
     }
 
     pub fn from_id(id: SpotifyUri) -> Self {
-        Track { id }
+        Track {
+            id,
+            source_playlist: None,
+        }
+    }
+
+    pub fn from_id_in_playlist(id: SpotifyUri, playlist: String) -> Self {
+        Track {
+            id,
+            source_playlist: Some(playlist),
+        }
     }
 
     pub async fn metadata(&self, session: &Session) -> Result<TrackMetadata> {
@@ -217,9 +231,15 @@ impl TrackCollection for Playlist {
         let playlist = librespot::metadata::Playlist::get(session, &self.id)
             .await
             .expect("Failed to get playlist");
+        let playlist_name = clean_invalid_characters(&playlist.attributes.name);
+        let playlist_name = if playlist_name.trim().is_empty() {
+            "Unknown Playlist".to_string()
+        } else {
+            playlist_name
+        };
         playlist
             .tracks()
-            .map(|track| Track::from_id(track.clone()))
+            .map(|track| Track::from_id_in_playlist(track.clone(), playlist_name.clone()))
             .collect()
     }
 }
@@ -273,6 +293,21 @@ impl TrackMetadata {
         };
         Ok(tags)
     }
+
+    pub fn to_path_string(&self) -> String {
+        let artist = self
+            .album
+            .artists
+            .first()
+            .map(String::as_str)
+            .or_else(|| self.artists.first().map(|artist| artist.name.as_str()));
+        format!(
+            "{}/{}/{}",
+            clean_path_component(artist, "Unknown Artist"),
+            clean_path_component(Some(self.album.name.as_str()), "Unknown Album"),
+            clean_path_component(Some(self.track_name.as_str()), "Unknown Title")
+        )
+    }
 }
 
 impl ToString for TrackMetadata {
@@ -317,6 +352,7 @@ impl From<librespot::metadata::Artist> for ArtistMetadata {
 #[derive(Clone, Debug)]
 pub struct AlbumMetadata {
     pub name: String,
+    pub artists: Vec<String>,
     pub cover: Option<Image>,
 }
 
@@ -324,7 +360,22 @@ impl From<librespot::metadata::Album> for AlbumMetadata {
     fn from(album: librespot::metadata::Album) -> Self {
         AlbumMetadata {
             name: album.name.clone(),
+            artists: album
+                .artists
+                .0
+                .iter()
+                .map(|artist| artist.name.clone())
+                .collect(),
             cover: album.covers.first().cloned(),
         }
+    }
+}
+
+fn clean_path_component(component: Option<&str>, fallback: &str) -> String {
+    let cleaned = component.map(clean_invalid_characters).unwrap_or_default();
+    if cleaned.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
     }
 }

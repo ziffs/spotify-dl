@@ -63,6 +63,21 @@ ARGS:
 
 Songs, playlists and albums must be passed as Spotify URIs or URLs (e.g. `spotify:track:123456789abcdefghABCDEF` for songs and `spotify:playlist:123456789abcdefghABCDEF` for playlists or `https://open.spotify.com/playlist/123456789abcdefghABCDEF?si=1234567890`).
 
+## 📁 Output structure
+
+Tracks are saved as `Artist/Album/Title.ext` under the destination folder (default: current directory), where `ext` is the selected format (`flac` or `mp3`):
+
+```
+Music/
+├── Daft Punk/
+│   └── Discovery/
+│       ├── One More Time.flac
+│       └── Aerodynamic.flac
+└── My Playlist.m3u
+```
+
+When downloading a playlist, a `<Playlist Name>.m3u` file is automatically created in the destination root, referencing the downloaded tracks with relative paths (e.g. `Daft Punk/Discovery/One More Time.flac`), so the folder can be moved as a unit.
+
 ## 📋 Examples
 
 - Download a single track:
@@ -78,7 +93,7 @@ spotify-dl -u YOUR_USER -p YOUR_PASS https://open.spotify.com/playlist/PLAYLIST_
 
 Save as MP3 to a custom folder:
 ```
-spotify-dl --format flac --destination ~/Music/Spotify https://open.spotify.com/album/ALBUM_ID
+spotify-dl --format mp3 --destination ~/Music/Spotify https://open.spotify.com/album/ALBUM_ID
 ```
 
 Download a playlist with rate limiting:
