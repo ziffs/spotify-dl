@@ -73,12 +73,6 @@ impl Downloader {
 
         let mut filenames = Vec::new();
         for track in tracks.into_iter() {
-            if options.rate_limit {
-                if let Some(rate_limiter) = &options.rate_limiter {
-                    rate_limiter.acquire().await?;
-                }
-            }
-
             let filename = match self.download_track(&track, options).await {
                 Err(err) => {
                     tracing::warn!("Error in track {:?}: {:?}", track.id, err);
@@ -139,6 +133,14 @@ impl Downloader {
                 &metadata.track_name
             );
             return Ok(relative_path);
+        }
+
+        // Only actual downloads are rate limited, not metadata requests or
+        // tracks skipped because they already exist on disk.
+        if options.rate_limit {
+            if let Some(rate_limiter) = &options.rate_limiter {
+                rate_limiter.acquire().await?;
+            }
         }
 
         let pb = self.add_progress_bar(&metadata);

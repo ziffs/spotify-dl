@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -16,8 +17,17 @@ use anyhow::anyhow;
 use governor::DefaultDirectRateLimiter;
 use governor::Quota;
 use governor::RateLimiter;
+use tokio::time::sleep;
+use tracing::info;
 use tracing::trace;
 use tracing::warn;
+
+/// How often the remaining wait time is checked and reported.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Lower bound for the poll interval, so a tiny `report_interval` can't cause
+/// a busy loop.
+const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Configuration for the persistent download rate limiter.
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +36,9 @@ pub struct RateLimitConfig {
     pub max_downloads: NonZeroU32,
     /// Refill period for a single download token.
     pub period: Duration,
+    /// Waits longer than this are reported to the user, followed by a
+    /// countdown of the remaining wait time, updated once per interval.
+    pub report_interval: Duration,
 }
 
 impl Default for RateLimitConfig {
@@ -33,6 +46,7 @@ impl Default for RateLimitConfig {
         Self {
             max_downloads: NonZeroU32::new(30).expect("30 is non-zero"),
             period: Duration::from_secs(60),
+            report_interval: Duration::from_secs(5),
         }
     }
 }
@@ -139,8 +153,11 @@ impl PersistentRateLimiter {
 
     /// Wait until the rate limiter allows another download, then record the
     /// spent token in the persisted state file.
+    ///
+    /// Waits longer than [`RateLimitConfig::report_interval`] are announced
+    /// once, followed by a countdown of the remaining wait time.
     pub async fn acquire(&self) -> Result<()> {
-        self.limiter.until_ready().await;
+        self.wait_with_progress().await;
 
         let (tokens, last_refill_epoch_ms) = {
             let mut tracked = self
@@ -167,6 +184,37 @@ impl PersistentRateLimiter {
         );
 
         Ok(())
+    }
+
+    /// Poll the limiter until a token is available, logging the remaining wait
+    /// time while waiting. A successful `check` consumes the token, exactly
+    /// like `until_ready` would.
+    async fn wait_with_progress(&self) {
+        let mut last_report: Option<Instant> = None;
+        loop {
+            match self.limiter.check() {
+                Ok(_) => return,
+                Err(not_until) => {
+                    let wait = not_until.wait_time_from(Instant::now());
+                    let reporting = last_report.is_some();
+                    if wait > self.config.report_interval || reporting {
+                        let due = last_report
+                            .map_or(true, |last| last.elapsed() >= self.config.report_interval);
+                        if due {
+                            info!(
+                                "Rate limit reached: next download in {:.1}s",
+                                wait.as_secs_f64()
+                            );
+                            last_report = Some(Instant::now());
+                        }
+                    }
+                    let poll = POLL_INTERVAL
+                        .min(self.config.report_interval)
+                        .max(MIN_POLL_INTERVAL);
+                    sleep(poll.min(wait)).await;
+                }
+            }
+        }
     }
 }
 
@@ -281,6 +329,9 @@ fn current_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -295,6 +346,9 @@ mod tests {
         RateLimitConfig {
             max_downloads: std::num::NonZeroU32::new(max).unwrap(),
             period: Duration::from_millis(period_ms),
+            // Keep existing tests silent: only the dedicated reporting test
+            // opts into short report intervals.
+            report_interval: Duration::from_secs(3600),
         }
     }
 
@@ -471,6 +525,69 @@ mod tests {
         assert!(
             state.last_refill_epoch_ms <= current_epoch_ms(),
             "last_refill should not be in the future"
+        );
+    }
+
+    #[derive(Clone)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Waits longer than `report_interval` must produce an announcement with
+    /// the remaining wait time, followed by countdown updates.
+    #[tokio::test]
+    async fn long_waits_are_reported_with_remaining_time() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("rate_limit.json");
+        let config = RateLimitConfig {
+            max_downloads: std::num::NonZeroU32::new(1).unwrap(),
+            period: Duration::from_millis(300),
+            report_interval: Duration::from_millis(50),
+        };
+        let limiter = PersistentRateLimiter::new(state_path, config).unwrap();
+
+        let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let capture = LogCapture(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        limiter.acquire().await.unwrap(); // consumes the burst token
+        limiter.acquire().await.unwrap(); // must wait a full period
+
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+
+        let remaining: Vec<f64> = logs
+            .lines()
+            .filter_map(|line| {
+                let pos = line.find("next download in ")?;
+                line[pos + "next download in ".len()..]
+                    .trim_end_matches('s')
+                    .parse::<f64>()
+                    .ok()
+            })
+            .collect();
+
+        assert!(
+            remaining.len() >= 3,
+            "expected an announcement plus countdown updates, got: {}",
+            logs
+        );
+        assert!(
+            remaining.first().unwrap() > remaining.last().unwrap(),
+            "remaining wait time should count down, got: {:?}",
+            remaining
         );
     }
 }
