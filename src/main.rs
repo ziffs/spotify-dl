@@ -37,7 +37,7 @@ struct Opt {
     force: bool,
     #[structopt(
         short = "r",
-        long = "rate-limit",
+        long = "no-rate-limit",
         help = "Don't rate limit downloads to one track every minute"
     )]
     no_rate_limit: bool,
