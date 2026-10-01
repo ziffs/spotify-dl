@@ -21,7 +21,10 @@ impl Mp3Encoder {
             anyhow::anyhow!("Failed to set number of channels for mp3 encoder: {}", e)
         })?;
         builder
-            .set_brate(mp3lame_encoder::Bitrate::Kbps320)
+            .set_vbr_mode(mp3lame_encoder::VbrMode::default())
+            .map_err(|e| anyhow::anyhow!("Failed to set VBR mode for mp3 encoder: {}", e))?;
+        builder
+            .set_vbr_quality(mp3lame_encoder::Quality::Best)
             .map_err(|e| anyhow::anyhow!("Failed to set bitrate for mp3 encoder: {}", e))?;
 
         builder
