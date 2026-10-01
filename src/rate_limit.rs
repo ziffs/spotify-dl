@@ -46,7 +46,7 @@ impl Default for RateLimitConfig {
         Self {
             max_downloads: NonZeroU32::new(30).expect("30 is non-zero"),
             period: Duration::from_secs(60),
-            report_interval: Duration::from_secs(5),
+            report_interval: Duration::from_secs(30),
         }
     }
 }

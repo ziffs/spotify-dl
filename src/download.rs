@@ -110,7 +110,11 @@ impl Downloader {
         Ok(())
     }
 
-    #[tracing::instrument(name = "download_track", skip(self))]
+    #[tracing::instrument(
+        name = "download_track",
+        skip(self, track, options),
+        fields(track = %track.id)
+    )]
     async fn download_track(&self, track: &Track, options: &DownloadOptions) -> Result<String> {
         let metadata = track.metadata(&self.session).await?;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
