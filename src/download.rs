@@ -31,10 +31,11 @@ pub struct DownloadOptions {
     pub parallel: usize,
     pub format: Format,
     pub force: bool,
+    pub playlist_file: Option<String>,
 }
 
 impl DownloadOptions {
-    pub fn new(destination: Option<String>, parallel: usize, format: Format, force: bool) -> Self {
+    pub fn new(destination: Option<String>, parallel: usize, format: Format, force: bool, playlist_file: Option<String>) -> Self {
         let destination =
             destination.map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
         DownloadOptions {
@@ -42,6 +43,7 @@ impl DownloadOptions {
             parallel,
             format,
             force,
+            playlist_file,
         }
     }
 }
@@ -60,34 +62,43 @@ impl Downloader {
         options: &DownloadOptions,
     ) -> Result<()> {
         let total = tracks.len();
-        futures::stream::iter(tracks.iter().enumerate())
+        let filenames = futures::stream::iter(tracks.iter().enumerate())
             .map(async |(i, track)| {
                 let index = if total > 1 { Some(i + 1) } else { None };
-                if let Err(err) = self.download_track(&track, options, index).await {
-                    tracing::warn!("Error in track {:?}: {:?}", track.id, err);
-                }
-                anyhow::Ok(())
+                let filename = match self.download_track(&track, options, index).await {
+                    Err(err) => {
+                        tracing::warn!("Error in track {:?}: {:?}", track.id, err);
+                        "".to_string()
+                    }
+                    Ok(filename) => filename,
+                };
+                anyhow::Ok(filename)
             })
             .buffer_unordered(options.parallel)
-            .try_collect::<Vec<_>>()
+            .try_collect::<Vec<String>>()
             .await?;
 
+        if let Some(playlist_file) = &options.playlist_file {
+            let content = filenames.iter()
+                .map(|s| s.clone())
+                .map(|s| format!("{}\n", s))
+                .collect::<Vec<String>>().join("");
+            tokio::fs::write(playlist_file, content).await?;
+            tracing::info!("Wrote playlist file: {:?}", playlist_file);
+        }
         Ok(())
     }
 
     #[tracing::instrument(name = "download_track", skip(self))]
-    async fn download_track(&self, track: &Track, options: &DownloadOptions, index: Option<usize>) -> Result<()> {
+    async fn download_track(&self, track: &Track, options: &DownloadOptions, index: Option<usize>) -> Result<String> {
         let metadata = track.metadata(&self.session).await?;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
 
-        let filename = match index {
-            Some(i) => format!("{:02} - {}", i, metadata.to_string()),
-            None => metadata.to_string(),
-        };
+        let filename = metadata.to_string();
 
         let path = options
             .destination
-            .join(filename)
+            .join(&filename)
             .with_extension(options.format.extension())
             .to_str()
             .ok_or(anyhow::anyhow!("Could not set the output path"))?
@@ -98,7 +109,8 @@ impl Downloader {
                 "Skipping {}, file already exists. Use --force to force re-downloading the track",
                 &metadata.track_name
             );
-            return Ok(());
+            let filename = PathBuf::from(&filename).with_extension(options.format.extension()).to_str().unwrap().to_string();
+            return Ok(filename);
         }
 
         let pb = self.add_progress_bar(&metadata);
@@ -108,7 +120,7 @@ impl Downloader {
             Ok(channel) => channel,
             Err(e) => {
                 self.fail_with_error(&pb, &metadata.to_string(), e.to_string());
-                return Ok(());
+                return Ok("".to_string());
             }
         };
 
@@ -116,7 +128,7 @@ impl Downloader {
             Ok(samples) => samples,
             Err(e) => {
                 self.fail_with_error(&pb, &metadata.to_string(), e.to_string());
-                return Ok(());
+                return Ok("".to_string());
             }
         };
 
@@ -138,7 +150,7 @@ impl Downloader {
         encoder::tags::store_tags(path, &tags, options.format).await?;
 
         pb.finish_with_message(format!("Downloaded {}", metadata.to_string()));
-        Ok(())
+        Ok("".to_string())
     }
 
     fn add_progress_bar(&self, track: &TrackMetadata) -> ProgressBar {

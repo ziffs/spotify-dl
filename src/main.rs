@@ -37,6 +37,12 @@ struct Opt {
     )]
     format: Format,
     #[structopt(
+        short = "p",
+        long = "playlist-file",
+        help = "Write all tracks into a playlist file.",
+    )]
+    playlist_file: Option<String>,
+    #[structopt(
         short = "F",
         long = "force",
         help = "Force download even if the file already exists"
@@ -74,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     downloader
         .download_tracks(
             track,
-            &DownloadOptions::new(opt.destination, opt.parallel, opt.format, opt.force),
+            &DownloadOptions::new(opt.destination, opt.parallel, opt.format, opt.force, opt.playlist_file),
         )
         .await
 }

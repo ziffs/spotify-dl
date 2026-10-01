@@ -77,7 +77,7 @@ pub fn configure_logger() -> Result<()> {
 
     let console_layer = fmt::layer().with_target(false).with_filter(
         EnvFilter::builder()
-            .with_default_directive(LevelFilter::OFF.into())
+            .with_default_directive(LevelFilter::INFO.into())
             .from_env_lossy(),
     );
 
