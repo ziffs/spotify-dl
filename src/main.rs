@@ -23,20 +23,6 @@ struct Opt {
     )]
     destination: Option<String>,
     #[structopt(
-        short = "t",
-        long = "parallel",
-        help = "Number of parallel downloads. Default is 5.",
-        default_value = "5"
-    )]
-    parallel: usize,
-    #[structopt(
-        short = "f",
-        long = "format",
-        help = "The format to download the tracks in. Default is flac.",
-        default_value = "flac"
-    )]
-    format: Format,
-    #[structopt(
         short = "p",
         long = "playlist-file",
         help = "Write all tracks into a playlist file.",
@@ -51,6 +37,7 @@ struct Opt {
     #[structopt(
         short = "r",
         long = "rate-limit",
+        default_value = "true",
         help = "Rate limit downloads to one track every minute"
     )]
     rate_limit: bool,

@@ -29,7 +29,6 @@ pub struct Downloader {
 #[derive(Debug, Clone)]
 pub struct DownloadOptions {
     pub destination: PathBuf,
-    pub parallel: usize,
     pub format: Format,
     pub force: bool,
     pub playlist_file: Option<String>,
@@ -37,12 +36,11 @@ pub struct DownloadOptions {
 }
 
 impl DownloadOptions {
-    pub fn new(destination: Option<String>, parallel: usize, format: Format, force: bool, playlist_file: Option<String>,rate_limit: bool) -> Self {
+    pub fn new(destination: Option<String>, format: Format, force: bool, playlist_file: Option<String>,rate_limit: bool) -> Self {
         let destination =
             destination.map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
         DownloadOptions {
             destination,
-            parallel,
             format,
             force,
             playlist_file,
@@ -244,7 +242,6 @@ mod tests {
         // Create a mock downloader and options
         let _options = DownloadOptions {
             destination: PathBuf::from("/tmp"),
-            parallel: 1,
             format: Format::Flac,
             force: false,
             rate_limit: true,
