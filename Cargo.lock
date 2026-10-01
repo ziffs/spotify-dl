@@ -541,7 +541,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2816,6 +2816,7 @@ dependencies = [
  "dirs",
  "flacenc",
  "futures",
+ "governor",
  "id3",
  "indicatif",
  "lazy_static",
@@ -2825,6 +2826,7 @@ dependencies = [
  "once_cell",
  "regex",
  "structopt",
+ "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
