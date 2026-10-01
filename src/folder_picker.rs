@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Result;
-use anyhow::anyhow;
 use ratatui::crossterm::event as crossterm_event;
 use ratatui::crossterm::event::Event;
 use ratatui::crossterm::event::KeyCode;
@@ -61,57 +60,111 @@ struct FolderInfo {
     children: Vec<usize>,
 }
 
+/// What the picker wants to happen after the user leaves it.
+pub enum Outcome {
+    /// The user confirmed with Enter; contains the selected playlist URIs.
+    Selected(Vec<String>),
+    /// The user cancelled with Esc/q.
+    Cancelled,
+}
+
+/// The kind of a visible row, for callers that inspect the tree view without
+/// touching the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    Folder,
+    Playlist,
+}
+
 /// Interactive tree view over the account's playlist folders.
 ///
 /// The terminal interaction lives in [`run`]; the state transitions are kept as
 /// plain methods so they can be exercised by unit tests.
-pub(crate) struct FolderPicker {
+pub struct FolderPicker {
     folders: HashMap<usize, FolderInfo>,
     top_level: Vec<usize>,
     root_playlists: Vec<String>,
     names: HashMap<String, String>,
+    /// Playlists a download run has completed, by unix timestamp (seconds).
+    downloaded: HashMap<String, u64>,
     rows: Vec<Row>,
     cursor: usize,
     collapsed: HashSet<usize>,
     checked: HashSet<String>,
     status: Option<String>,
+    refresh_requested: bool,
     quit: bool,
     submit: bool,
 }
 
 impl FolderPicker {
-    pub(crate) fn new(root: &Folder, names: HashMap<String, String>) -> Self {
-        let mut folders = HashMap::new();
-        let mut next_id = 0usize;
-        let mut top_level = Vec::new();
-        for folder in &root.children {
-            let id = register_folder(folder, &mut next_id, &mut folders);
-            top_level.push(id);
-        }
-
+    pub fn new(root: &Folder, names: HashMap<String, String>) -> Self {
         let mut picker = Self {
-            folders,
-            top_level,
-            root_playlists: dedupe(root.playlists.clone()),
+            folders: HashMap::new(),
+            top_level: Vec::new(),
+            root_playlists: Vec::new(),
             names,
+            downloaded: HashMap::new(),
             rows: Vec::new(),
             cursor: 0,
             collapsed: HashSet::new(),
             checked: HashSet::new(),
             status: None,
+            refresh_requested: false,
             quit: false,
             submit: false,
         };
+        picker.register_tree(root);
         picker.rebuild_rows();
         picker
     }
 
-    pub(crate) fn selected_count(&self) -> usize {
+    /// Pre-selects playlists from a previous run; URIs that no longer exist in
+    /// the tree are dropped.
+    pub fn with_pre_checked(mut self, uris: HashSet<String>) -> Self {
+        let all = self.all_tree_uris();
+        self.checked = uris.into_iter().filter(|uri| all.contains(uri)).collect();
+        self
+    }
+
+    pub fn with_downloaded(mut self, downloaded: HashMap<String, u64>) -> Self {
+        self.downloaded = downloaded;
+        self
+    }
+
+    pub fn selected_count(&self) -> usize {
         self.checked.len()
     }
 
+    /// The currently checked playlist URIs.
+    pub fn checked(&self) -> &HashSet<String> {
+        &self.checked
+    }
+
+    pub(crate) fn set_status(&mut self, status: Option<String>) {
+        self.status = status;
+    }
+
+    /// Number of currently visible rows.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The kind of the row at `index`, if visible.
+    pub fn row_kind(&self, index: usize) -> Option<RowKind> {
+        Some(match self.rows.get(index)? {
+            Row::Folder { .. } => RowKind::Folder,
+            Row::Playlist { .. } => RowKind::Playlist,
+        })
+    }
+
+    /// Moves the cursor to `index`, clamped to the visible rows.
+    pub fn set_cursor(&mut self, index: usize) {
+        self.cursor = index.min(self.rows.len().saturating_sub(1));
+    }
+
     /// The selected playlist URIs, in tree order.
-    pub(crate) fn selected_uris(&self) -> Vec<String> {
+    pub fn selected_uris(&self) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for uri in &self.root_playlists {
@@ -133,7 +186,7 @@ impl FolderPicker {
         self.quit
     }
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
@@ -145,33 +198,34 @@ impl FolderPicker {
             KeyCode::End | KeyCode::Char('G') => self.move_end(),
             KeyCode::Left | KeyCode::Char('h') => self.collapse_current(),
             KeyCode::Right | KeyCode::Char('l') => self.expand_current(),
+            KeyCode::Char('r') | KeyCode::Char('R') => self.refresh_requested = true,
             KeyCode::Char(' ') => self.toggle_current(),
             KeyCode::Enter => self.confirm(),
             _ => {}
         }
     }
 
-    fn move_up(&mut self) {
+    pub fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
-    fn move_down(&mut self) {
+    pub fn move_down(&mut self) {
         if self.cursor + 1 < self.rows.len() {
             self.cursor += 1;
         }
     }
 
-    fn move_home(&mut self) {
+    pub fn move_home(&mut self) {
         self.cursor = 0;
     }
 
-    fn move_end(&mut self) {
+    pub fn move_end(&mut self) {
         self.cursor = self.rows.len().saturating_sub(1);
     }
 
     /// Space: toggles the highlighted playlist, or every playlist inside the
     /// highlighted folder (recursively).
-    fn toggle_current(&mut self) {
+    pub fn toggle_current(&mut self) {
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return;
         };
@@ -210,7 +264,7 @@ impl FolderPicker {
 
     /// Left: collapses the highlighted folder, or — when on a playlist — its
     /// parent folder.
-    fn collapse_current(&mut self) {
+    pub fn collapse_current(&mut self) {
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return;
         };
@@ -235,7 +289,7 @@ impl FolderPicker {
     }
 
     /// Right: expands the highlighted folder.
-    fn expand_current(&mut self) {
+    pub fn expand_current(&mut self) {
         let Some(Row::Folder { id, .. }) = self.rows.get(self.cursor) else {
             return;
         };
@@ -251,6 +305,45 @@ impl FolderPicker {
         } else {
             self.submit = true;
         }
+    }
+
+    fn take_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_requested)
+    }
+
+    /// Replaces the tree and names after a metadata refresh, keeping the
+    /// selection (restricted to playlists that still exist) and the downloaded
+    /// status.
+    pub(crate) fn update(&mut self, root: Folder, names: HashMap<String, String>) {
+        self.register_tree(&root);
+        self.names = names;
+        self.collapsed.clear();
+        self.status = None;
+        let all = self.all_tree_uris();
+        self.checked.retain(|uri| all.contains(uri));
+        self.rebuild_rows();
+    }
+
+    fn all_tree_uris(&self) -> HashSet<String> {
+        let mut out: HashSet<String> = self.root_playlists.iter().cloned().collect();
+        for info in self.folders.values() {
+            out.extend(info.playlists.iter().cloned());
+        }
+        out
+    }
+
+    /// Registers the folders of `root`, assigning fresh stable ids.
+    fn register_tree(&mut self, root: &Folder) {
+        let mut folders = HashMap::new();
+        let mut next_id = 0usize;
+        let mut top_level = Vec::new();
+        for folder in &root.children {
+            let id = register_folder(folder, &mut next_id, &mut folders);
+            top_level.push(id);
+        }
+        self.folders = folders;
+        self.top_level = top_level;
+        self.root_playlists = dedupe(root.playlists.clone());
     }
 
     fn folder_state(&self, id: usize) -> CheckState {
@@ -318,6 +411,16 @@ impl FolderPicker {
                     CheckState::None => Span::raw("[ ] "),
                 };
                 let count = info.recursive_uris.len();
+                let downloaded = info
+                    .recursive_uris
+                    .iter()
+                    .filter(|uri| self.downloaded.contains_key(*uri))
+                    .count();
+                let downloaded_note = if downloaded > 0 {
+                    format!(", {downloaded} downloaded")
+                } else {
+                    String::new()
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw("  ".repeat(*depth)),
                     Span::raw(marker),
@@ -327,9 +430,10 @@ impl FolderPicker {
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!(
-                        " ({} playlist{})",
+                        " ({} playlist{}{})",
                         count,
-                        if count == 1 { "" } else { "s" }
+                        if count == 1 { "" } else { "s" },
+                        downloaded_note
                     )),
                 ]))
             }
@@ -339,21 +443,39 @@ impl FolderPicker {
                 } else {
                     Span::raw("[ ] ")
                 };
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::raw("  ".repeat(*depth)),
                     checkbox,
                     Span::raw(self.display_name(uri)),
-                ]))
+                ];
+                if self.downloaded.contains_key(uri) {
+                    spans.push(Span::styled(" ✓", Style::default().fg(Color::Green)));
+                }
+                ListItem::new(Line::from(spans))
             }
         }
     }
 }
 
-/// Shows the tree view and returns the selected playlist URIs once the user
-/// confirms with Enter. Cancelling (Esc/q) yields an error.
-pub(crate) fn run(root: &Folder, names: HashMap<String, String>) -> Result<Vec<String>> {
+/// Shows the tree view and returns the outcome once the user leaves it with
+/// Enter (selection) or Esc/q (cancel).
+///
+/// `persist` is called whenever the selection changes, so an abort keeps the
+/// selection for the next run. `refresh` re-fetches the account's tree and
+/// playlist names (triggered with `R`); the picker is updated in place.
+pub(crate) fn run(
+    root: &Folder,
+    names: HashMap<String, String>,
+    pre_checked: HashSet<String>,
+    downloaded: HashMap<String, u64>,
+    persist: &mut dyn FnMut(&HashSet<String>),
+    refresh: &mut dyn FnMut() -> Result<(Folder, HashMap<String, String>)>,
+) -> Result<Outcome> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, FolderPicker::new(root, names));
+    let picker = FolderPicker::new(root, names)
+        .with_pre_checked(pre_checked)
+        .with_downloaded(downloaded);
+    let result = event_loop(&mut terminal, picker, persist, refresh);
     ratatui::restore();
     result
 }
@@ -361,7 +483,10 @@ pub(crate) fn run(root: &Folder, names: HashMap<String, String>) -> Result<Vec<S
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     mut picker: FolderPicker,
-) -> Result<Vec<String>> {
+    persist: &mut dyn FnMut(&HashSet<String>),
+    refresh: &mut dyn FnMut() -> Result<(Folder, HashMap<String, String>)>,
+) -> Result<Outcome> {
+    let mut saved_checked = picker.checked().clone();
     loop {
         terminal.draw(|frame| draw(frame, &picker))?;
         if !crossterm_event::poll(POLL_TIMEOUT)? {
@@ -370,10 +495,22 @@ fn event_loop(
         if let Event::Key(key) = crossterm_event::read()? {
             picker.handle_key(key);
             if picker.should_submit() {
-                return Ok(picker.selected_uris());
+                return Ok(Outcome::Selected(picker.selected_uris()));
             }
             if picker.should_quit() {
-                return Err(anyhow!("Aborted — no playlists selected"));
+                return Ok(Outcome::Cancelled);
+            }
+            if picker.take_refresh() {
+                picker.set_status(Some("Refreshing metadata from account...".to_string()));
+                terminal.draw(|frame| draw(frame, &picker))?;
+                match refresh() {
+                    Ok((root, names)) => picker.update(root, names),
+                    Err(err) => picker.set_status(Some(format!("Refresh failed: {err:#}"))),
+                }
+            }
+            if picker.checked() != &saved_checked {
+                saved_checked = picker.checked().clone();
+                persist(&saved_checked);
             }
         }
     }
@@ -833,6 +970,81 @@ mod tests {
         key.kind = KeyEventKind::Release;
         picker.handle_key(key);
         assert_eq!(picker.cursor, 0);
+    }
+
+    #[test]
+    fn pre_checked_uris_are_selected_on_start() {
+        let picker = picker().with_pre_checked(HashSet::from([
+            "spotify:playlist:work1".to_string(),
+            "spotify:playlist:gone".to_string(),
+        ]));
+
+        // "gone" no longer exists in the tree and is dropped.
+        assert_eq!(picker.selected_count(), 1);
+        assert_eq!(picker.selected_uris(), vec!["spotify:playlist:work1"]);
+        assert_eq!(picker.folder_state(0), CheckState::Partial);
+    }
+
+    #[test]
+    fn refresh_key_requests_a_refresh() {
+        let mut picker = picker();
+        picker.handle_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            crossterm_event::KeyModifiers::empty(),
+        ));
+        assert!(picker.take_refresh());
+        // The flag is consumed once.
+        assert!(!picker.take_refresh());
+    }
+
+    #[test]
+    fn update_keeps_selection_that_still_exists() {
+        let mut picker = picker();
+        picker.cursor = 1; // "Work"
+        picker.toggle_current();
+        assert_eq!(picker.selected_count(), 3);
+
+        // After a refresh, Gym and its playlists are gone from the account.
+        let new_root = folder(
+            "",
+            &["spotify:playlist:loose"],
+            vec![folder(
+                "Work",
+                &["spotify:playlist:work1", "spotify:playlist:new1"],
+                vec![],
+            )],
+        );
+        picker.update(new_root, HashMap::new());
+
+        assert_eq!(picker.selected_uris(), vec!["spotify:playlist:work1"]);
+        let keys: Vec<String> = (0..picker.rows.len())
+            .map(|i| row_key(&picker, i))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "playlist:spotify:playlist:loose",
+                "folder:Work",
+                "playlist:spotify:playlist:work1",
+                "playlist:spotify:playlist:new1",
+            ]
+        );
+    }
+
+    #[test]
+    fn downloaded_status_is_rendered() {
+        let mut downloaded = HashMap::new();
+        downloaded.insert("spotify:playlist:work1".to_string(), 42);
+        let picker = picker().with_downloaded(downloaded);
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &picker)).unwrap();
+        let content = buffer_content(terminal.backend().buffer());
+
+        assert!(content.contains("[ ] spotify:playlist:work1 ✓"));
+        assert!(content.contains("▾ [ ] Work (3 playlists, 1 downloaded)"));
+        assert!(content.contains("[ ] spotify:playlist:loose"));
+        assert!(!content.contains("loose ✓"));
     }
 
     #[test]

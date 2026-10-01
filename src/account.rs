@@ -1,31 +1,98 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use bytes::Bytes;
 use futures::StreamExt;
 use librespot::core::SpotifyUri;
 use librespot::core::session::Session;
 use librespot::core::spotify_id::SpotifyId;
-use librespot::metadata::Metadata;
-use librespot::metadata::Playlist;
 use librespot::protocol::playlist4_external::SelectedListContent;
 use protobuf::Message;
+use serde::Deserialize;
+use serde::Serialize;
 
+use crate::account_state::AccountState;
+use crate::capture::CaptureStore;
+use crate::capture::MockStore;
+use crate::capture::ROOTLIST_PAGE_SIZE;
 use crate::folder_picker;
+use crate::folder_picker::Outcome;
 
-/// Number of rootlist entries requested per page.
-const ROOTLIST_PAGE_SIZE: usize = 500;
 /// Hard cap on rootlist entries, so a misbehaving server cannot make us loop forever.
 const MAX_ROOTLIST_ITEMS: usize = 10_000;
 
-#[derive(Debug, Default)]
-pub(crate) struct Folder {
-    pub(crate) name: String,
-    pub(crate) playlists: Vec<String>,
-    pub(crate) children: Vec<Folder>,
+/// Where the account data (rootlist, playlist metadata) comes from.
+///
+/// [`AccountSource::Live`] talks to Spotify through the session and can
+/// optionally record every raw response with a [`CaptureStore`] (see the
+/// `SPOTIFY_DL_CAPTURE_DIR` environment variable); [`AccountSource::Mock`]
+/// serves previously captured and anonymized fixtures, running the whole
+/// flow offline.
+pub enum AccountSource {
+    Live {
+        session: Session,
+        capture: Option<CaptureStore>,
+    },
+    Mock {
+        store: MockStore,
+    },
+}
+
+impl AccountSource {
+    pub fn live(session: Session, capture_dir: Option<PathBuf>) -> Self {
+        Self::Live {
+            session,
+            capture: capture_dir.map(CaptureStore::new),
+        }
+    }
+
+    pub fn mock(dir: impl Into<PathBuf>) -> Self {
+        Self::Mock {
+            store: MockStore::new(dir),
+        }
+    }
+
+    async fn rootlist_page(&self, from: usize, length: usize) -> Result<Bytes> {
+        match self {
+            AccountSource::Live { session, capture } => {
+                let response = session.spclient().get_rootlist(from, Some(length)).await?;
+                if let Some(capture) = capture
+                    && let Err(err) = capture.save_rootlist_page(from, length, &response)
+                {
+                    tracing::warn!("Could not capture the rootlist response: {err:#}");
+                }
+                Ok(response)
+            }
+            AccountSource::Mock { store } => store.rootlist_page(from, length),
+        }
+    }
+
+    async fn playlist_bytes(&self, id: &SpotifyId) -> Result<Bytes> {
+        match self {
+            AccountSource::Live { session, capture } => {
+                let response = session.spclient().get_playlist(id).await?;
+                if let Some(capture) = capture
+                    && let Err(err) = capture.save_playlist(id, &response)
+                {
+                    tracing::warn!("Could not capture the playlist response: {err:#}");
+                }
+                Ok(response)
+            }
+            AccountSource::Mock { store } => store.playlist_bytes(id),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Folder {
+    pub name: String,
+    pub playlists: Vec<String>,
+    pub children: Vec<Folder>,
 }
 
 enum RootlistItem {
@@ -39,8 +106,103 @@ enum RootlistItem {
 /// tree view of its folders and playlists, and returns the URIs the user
 /// selected, so the caller can proceed as if they had been passed as download
 /// arguments.
-pub async fn select_folder_playlists(session: &Session) -> Result<Vec<String>> {
-    let uris = fetch_rootlist_uris(session).await?;
+///
+/// The selection, the folder tree, the playlist names and the downloaded
+/// status are persisted in the dot path: the selection is pre-selected on the
+/// next start, and the cache is used when the account cannot be reached.
+pub async fn select_folder_playlists(source: &AccountSource) -> Result<Vec<String>> {
+    let cached = AccountState::load().filter(|state| state.has_playlists());
+
+    let (root, mut names) = match fetch_account_data(source, false).await {
+        Ok(data) => data,
+        Err(err) => match &cached {
+            Some(state) => {
+                eprintln!(
+                    "Warning: could not refresh from account ({err:#}); showing cached playlists."
+                );
+                (state.root.clone(), state.names.clone())
+            }
+            None => return Err(err),
+        },
+    };
+
+    // Cached names fill gaps for playlists whose name could not be fetched.
+    if let Some(state) = &cached {
+        for (uri, name) in &state.names {
+            names.entry(uri.clone()).or_insert_with(|| name.clone());
+        }
+    }
+
+    let pre_checked: HashSet<String> = cached
+        .as_ref()
+        .map(|state| state.selected.iter().cloned().collect())
+        .unwrap_or_default();
+    let downloaded = cached
+        .as_ref()
+        .map(|state| state.downloaded.clone())
+        .unwrap_or_default();
+
+    let mut state = AccountState {
+        root: root.clone(),
+        names: names.clone(),
+        selected: pre_checked.iter().cloned().collect(),
+        downloaded: downloaded.clone(),
+    };
+    state.selected.sort();
+    state.save()?;
+
+    let handle = tokio::runtime::Handle::current();
+    let mut refresh =
+        move || tokio::task::block_in_place(|| handle.block_on(fetch_account_data(source, true)));
+
+    let outcome = folder_picker::run(
+        &root,
+        names,
+        pre_checked,
+        downloaded,
+        &mut |checked: &HashSet<String>| {
+            state.selected = checked.iter().cloned().collect();
+            state.selected.sort();
+            if let Err(err) = state.save() {
+                tracing::warn!("Could not save the selection: {err:#}");
+            }
+        },
+        &mut refresh,
+    )?;
+
+    match outcome {
+        Outcome::Selected(selected) => {
+            state.selected = selected.clone();
+            state.save()?;
+
+            println!(
+                "Downloading {} playlist{}:",
+                selected.len(),
+                if selected.len() == 1 { "" } else { "s" }
+            );
+            for playlist in &selected {
+                println!("  - {playlist}");
+            }
+
+            Ok(selected)
+        }
+        Outcome::Cancelled => Err(anyhow!(
+            "Aborted — the selection was saved and will be pre-selected on the next run"
+        )),
+    }
+}
+
+/// Marks the given playlists as downloaded in the persistent state.
+pub fn mark_playlists_downloaded(uris: &[String]) -> Result<()> {
+    AccountState::mark_downloaded(uris)
+}
+
+/// Fetches the folder tree and the playlist display names from the account.
+pub async fn fetch_account_data(
+    source: &AccountSource,
+    quiet: bool,
+) -> Result<(Folder, HashMap<String, String>)> {
+    let uris = fetch_rootlist_uris(source).await?;
     let root = build_folder_tree(&uris);
 
     let mut all_uris = Vec::new();
@@ -52,33 +214,18 @@ pub async fn select_folder_playlists(session: &Session) -> Result<Vec<String>> {
         ));
     }
 
-    let names = fetch_playlist_names(session, &dedupe(all_uris)).await;
-
-    let selected = folder_picker::run(&root, names)?;
-
-    println!(
-        "Downloading {} playlist{}:",
-        selected.len(),
-        if selected.len() == 1 { "" } else { "s" }
-    );
-    for playlist in &selected {
-        println!("  - {}", playlist);
-    }
-
-    Ok(selected)
+    let names = fetch_playlist_names(source, &dedupe(all_uris), quiet).await;
+    Ok((root, names))
 }
 
 /// Fetches the account's rootlist, paginating until every entry has been read.
 /// Returns the raw item URIs in sidebar order.
-async fn fetch_rootlist_uris(session: &Session) -> Result<Vec<String>> {
-    let spclient = session.spclient();
+async fn fetch_rootlist_uris(source: &AccountSource) -> Result<Vec<String>> {
     let mut uris: Vec<String> = Vec::new();
     let mut from = 0usize;
 
     loop {
-        let response = spclient
-            .get_rootlist(from, Some(ROOTLIST_PAGE_SIZE))
-            .await?;
+        let response = source.rootlist_page(from, ROOTLIST_PAGE_SIZE).await?;
         let content = SelectedListContent::parse_from_bytes(&response)
             .map_err(|err| anyhow!("Failed to parse the account's rootlist: {}", err))?;
 
@@ -88,7 +235,7 @@ async fn fetch_rootlist_uris(session: &Session) -> Result<Vec<String>> {
             .get_or_default()
             .items
             .iter()
-            .map(|item| item.uri().to_owned())
+            .filter_map(|item| item.uri.clone())
             .collect::<Vec<_>>();
 
         let received = fetched.len();
@@ -166,7 +313,7 @@ fn classify(uri: &str) -> RootlistItem {
 
 /// Folder names are carried in the start marker URI, form-urlencoded style:
 /// `+` stands for a space and `%XX` escapes single bytes.
-fn decode_group_name(raw: &str) -> String {
+pub(crate) fn decode_group_name(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -208,7 +355,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 /// Collects every playlist URI in the tree, in tree order (with duplicates).
-fn collect_all_uris(folder: &Folder, out: &mut Vec<String>) {
+pub(crate) fn collect_all_uris(folder: &Folder, out: &mut Vec<String>) {
     out.extend(folder.playlists.iter().cloned());
     for child in &folder.children {
         collect_all_uris(child, out);
@@ -218,7 +365,11 @@ fn collect_all_uris(folder: &Folder, out: &mut Vec<String>) {
 /// Resolves the display names of the given playlists concurrently. Playlists
 /// whose name cannot be fetched are simply absent from the result (the picker
 /// falls back to showing their URI).
-async fn fetch_playlist_names(session: &Session, uris: &[String]) -> HashMap<String, String> {
+async fn fetch_playlist_names(
+    source: &AccountSource,
+    uris: &[String],
+    quiet: bool,
+) -> HashMap<String, String> {
     const CONCURRENCY: usize = 16;
 
     if uris.is_empty() {
@@ -227,21 +378,24 @@ async fn fetch_playlist_names(session: &Session, uris: &[String]) -> HashMap<Str
 
     let total = uris.len();
     let fetched = &AtomicUsize::new(0);
-    eprint!("Fetching playlist names... 0/{total}");
+    if !quiet {
+        eprint!("Fetching playlist names... 0/{total}");
+    }
 
-    let results = futures::stream::iter(uris.iter().map(|uri| {
-        let session = session.clone();
-        async move {
-            let name = playlist_name(&session, uri).await;
-            let done = fetched.fetch_add(1, Ordering::Relaxed) + 1;
+    let results = futures::stream::iter(uris.iter().map(|uri| async move {
+        let name = playlist_name(source, uri).await;
+        let done = fetched.fetch_add(1, Ordering::Relaxed) + 1;
+        if !quiet {
             eprint!("\rFetching playlist names... {done}/{total}");
-            (uri.clone(), name)
         }
+        (uri.clone(), name)
     }))
     .buffer_unordered(CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
-    eprintln!();
+    if !quiet {
+        eprintln!();
+    }
 
     let mut names = HashMap::with_capacity(results.len());
     for (uri, name) in results {
@@ -252,10 +406,14 @@ async fn fetch_playlist_names(session: &Session, uris: &[String]) -> HashMap<Str
     names
 }
 
-async fn playlist_name(session: &Session, uri: &str) -> Option<String> {
+async fn playlist_name(source: &AccountSource, uri: &str) -> Option<String> {
     let parsed = SpotifyUri::from_uri(uri).ok()?;
-    let playlist = Playlist::get(session, &parsed).await.ok()?;
-    let name = playlist.attributes.name.trim();
+    let SpotifyUri::Playlist { id, .. } = parsed else {
+        return None;
+    };
+    let content =
+        SelectedListContent::parse_from_bytes(&source.playlist_bytes(&id).await.ok()?).ok()?;
+    let name = content.attributes.get_or_default().name().trim();
     (!name.is_empty()).then(|| name.to_string())
 }
 

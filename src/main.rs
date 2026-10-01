@@ -1,3 +1,5 @@
+use spotify_dl::account::AccountSource;
+use spotify_dl::account::mark_playlists_downloaded;
 use spotify_dl::account::select_folder_playlists;
 use spotify_dl::download::{DownloadOptions, Downloader};
 use spotify_dl::encoder::Format;
@@ -7,6 +9,7 @@ use spotify_dl::rate_limit::{PersistentRateLimiter, RateLimitConfig};
 use spotify_dl::session::create_session;
 use spotify_dl::track::get_tracks;
 use spotify_dl::utils::get_dot_path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use structopt::StructOpt;
 
@@ -95,18 +98,49 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    let session = create_session().await?;
+    let mock_dir = std::env::var_os("SPOTIFY_DL_MOCK_DIR").map(PathBuf::from);
+    if mock_dir.is_some() && !opt.from_account {
+        eprintln!("SPOTIFY_DL_MOCK_DIR only supports --from-account");
+        std::process::exit(1);
+    }
+    let capture_dir = std::env::var_os("SPOTIFY_DL_CAPTURE_DIR").map(PathBuf::from);
 
-    let tracks = if opt.from_account {
-        select_folder_playlists(&session).await?
+    let (source, session) = if let Some(dir) = mock_dir {
+        (AccountSource::mock(dir), None)
     } else {
-        opt.tracks
+        let session = create_session().await?;
+        (
+            AccountSource::live(session.clone(), capture_dir),
+            Some(session),
+        )
     };
+
+    let selection = if opt.from_account {
+        Some(select_folder_playlists(&source).await?)
+    } else {
+        None
+    };
+
+    let tracks = selection.clone().unwrap_or_else(|| opt.tracks.clone());
 
     if tracks.is_empty() {
         eprintln!("No tracks provided");
         std::process::exit(1);
     }
+
+    // Mock mode has no session: it stops after the picker and only reports
+    // what would have been downloaded.
+    let Some(session) = session else {
+        println!(
+            "Mock mode: would download {} playlist{}:",
+            tracks.len(),
+            if tracks.len() == 1 { "" } else { "s" }
+        );
+        for track in &tracks {
+            println!("  - {track}");
+        }
+        return Ok(());
+    };
 
     let track = get_tracks(tracks, &session).await?;
 
@@ -122,5 +156,15 @@ async fn main() -> anyhow::Result<()> {
                 rate_limiter,
             ),
         )
-        .await
+        .await?;
+
+    // Record the downloaded status once the run has finished, so the picker
+    // can show which playlists are already on disk.
+    if let Some(selected) = selection
+        && let Err(err) = mark_playlists_downloaded(&selected)
+    {
+        tracing::warn!("Could not save the downloaded status: {err:#}");
+    }
+
+    Ok(())
 }

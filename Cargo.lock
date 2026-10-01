@@ -3502,6 +3502,8 @@ dependencies = [
  "protobuf",
  "ratatui",
  "regex",
+ "serde",
+ "serde_json",
  "structopt",
  "tempfile",
  "thiserror 2.0.12",

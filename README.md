@@ -12,6 +12,7 @@ A command line utility to download songs, podcasts, playlists and albums directl
 
 - Download individual tracks, podcasts, playlists or full albums.
 - Browse your account's playlist folders in an interactive tree view and pick individual playlists and/or whole folders to download.
+- Remembers your selection, the folder tree, playlist names and what has already been downloaded between runs.
 - Built with Rust for speed and efficiency.
 - Supports metadata tagging and organized file output.
 
@@ -61,6 +62,8 @@ Songs, playlists and albums must be passed as Spotify URIs or URLs (e.g. `spotif
 
 Alternatively, pass `--from-account` (instead of any track arguments) to browse the playlist folders of the logged-in account: spotify-dl queries the folders and the playlists they contain and shows a full-screen tree view where you can select/de-select individual playlists and/or whole folders (toggling a folder selects everything inside it, including nested folders). Confirming with Enter downloads every selected playlist as if you had passed them all as arguments.
 
+The picker keeps its state in `~/.spotify-dl/account_state.json`: your selection is saved continuously and pre-selected on the next start, playlists already downloaded are marked with a ✓, and the folder tree and playlist names are cached so the picker also opens when Spotify cannot be reached. Press `R` inside the picker to refresh the metadata from your account.
+
 ## 📁 Output structure
 
 Tracks are saved as `Artist/Album/Title.ext` under the destination folder (default: current directory), where `ext` is the selected format (`flac` or `mp3`):
@@ -106,6 +109,27 @@ Download playlists from your account (interactive tree view — pick playlists o
 
 ```
 spotify-dl --from-account
+```
+
+## 🧪 Captures & mocks (development)
+
+Live runs can record every raw API response for offline testing:
+
+```
+SPOTIFY_DL_CAPTURE_DIR=/tmp/captures spotify-dl --from-account
+```
+
+The captures are anonymized into mock fixtures (every playlist id, folder id, name and username is replaced with deterministic random words & ids; playlist track lists are dropped) and used by the integration tests:
+
+```
+cargo run --example anonymize-captures -- /tmp/captures tests/fixtures/account
+cargo test --test account_mock
+```
+
+The picker can also run entirely offline against those fixtures (`SPOTIFY_DL_MOCK_DIR`); confirming a selection then only reports what would have been downloaded:
+
+```
+SPOTIFY_DL_MOCK_DIR=tests/fixtures/account spotify-dl --from-account
 ```
 
 ## 📄 License
