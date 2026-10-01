@@ -1,3 +1,4 @@
+pub mod account;
 pub mod download;
 pub mod encoder;
 pub mod lock;

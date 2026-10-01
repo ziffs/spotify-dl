@@ -1,3 +1,4 @@
+use spotify_dl::account::select_folder_playlists;
 use spotify_dl::download::{DownloadOptions, Downloader};
 use spotify_dl::encoder::Format;
 use spotify_dl::lock::InstanceLock;
@@ -17,9 +18,15 @@ use structopt::StructOpt;
 struct Opt {
     #[structopt(
         help = "A list of Spotify URIs or URLs (songs, podcasts, playlists or albums)",
-        required = true
+        required_unless = "from-account"
     )]
     tracks: Vec<String>,
+    #[structopt(
+        long = "from-account",
+        conflicts_with = "tracks",
+        help = "Browse the playlist folders of the logged-in account and pick one to download"
+    )]
+    from_account: bool,
     #[structopt(
         short = "d",
         long = "destination",
@@ -83,14 +90,25 @@ async fn main() -> anyhow::Result<()> {
 
     create_destination_if_required(opt.destination.clone())?;
 
-    if opt.tracks.is_empty() {
+    if !opt.from_account && opt.tracks.is_empty() {
         eprintln!("No tracks provided");
         std::process::exit(1);
     }
 
     let session = create_session().await?;
 
-    let track = get_tracks(opt.tracks, &session).await?;
+    let tracks = if opt.from_account {
+        select_folder_playlists(&session).await?
+    } else {
+        opt.tracks
+    };
+
+    if tracks.is_empty() {
+        eprintln!("No tracks provided");
+        std::process::exit(1);
+    }
+
+    let track = get_tracks(tracks, &session).await?;
 
     let downloader = Downloader::new(session);
     downloader
