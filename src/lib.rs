@@ -2,6 +2,7 @@ pub mod account;
 pub(crate) mod account_state;
 pub mod capture;
 pub mod download;
+pub mod download_ui;
 pub mod encoder;
 pub mod folder_picker;
 pub mod lock;

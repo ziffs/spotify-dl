@@ -1,16 +1,12 @@
-use std::fmt::Write;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
-use indicatif::MultiProgress;
-use indicatif::ProgressBar;
-use indicatif::ProgressState;
-use indicatif::ProgressStyle;
 use librespot::core::session::Session;
 
+use crate::download_ui::DownloadUi;
 use crate::encoder;
 use crate::encoder::Format;
 use crate::encoder::Samples;
@@ -23,7 +19,6 @@ use crate::track::TrackMetadata;
 
 pub struct Downloader {
     session: Session,
-    progress_bar: MultiProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -57,24 +52,41 @@ impl DownloadOptions {
 
 impl Downloader {
     pub fn new(session: Session) -> Self {
-        Downloader {
-            session,
-            progress_bar: MultiProgress::new(),
-        }
+        Downloader { session }
     }
 
+    /// Downloads the given tracks, updating `ui` with progress.
+    ///
+    /// Songs appearing in several playlists are downloaded once; every
+    /// playlist that contains a finished song gets its playlist file updated
+    /// and its percentage advanced. `Ctrl-C` in the download view requests a
+    /// graceful abort between songs.
     pub async fn download_tracks(
         self,
         tracks: Vec<Track>,
         options: &DownloadOptions,
+        ui: &DownloadUi,
     ) -> Result<()> {
         if options.rate_limit {
             tracing::info!("Rate limiting enabled: at most 30 downloads per 30 minutes");
         }
 
-        let mut playlists: Vec<(String, Vec<String>)> = Vec::new();
+        let mut seen: HashSet<librespot::core::SpotifyUri> = HashSet::new();
+        let mut playlist_files: Vec<(String, Vec<String>)> = Vec::new();
         for track in tracks.into_iter() {
-            let filename = match self.download_track(&track, options).await {
+            if ui.is_aborted() {
+                ui.finish();
+                return Err(anyhow::anyhow!("Download aborted"));
+            }
+            // The same song can appear in several playlists (or twice in one);
+            // it is downloaded once and every playlist containing it is
+            // updated when it finishes.
+            if !seen.insert(track.id.clone()) {
+                continue;
+            }
+
+            ui.track_started(&track);
+            let filename = match self.download_track(&track, options, ui).await {
                 Err(err) => {
                     tracing::warn!("Error in track {:?}: {:?}", track.id, err);
                     continue;
@@ -82,20 +94,30 @@ impl Downloader {
                 Ok(filename) if filename.is_empty() => continue,
                 Ok(filename) => filename,
             };
-            let Some(playlist) = track.source_playlist else {
-                continue;
-            };
-            let index = match playlists.iter().position(|(name, _)| name == &playlist) {
-                Some(index) => index,
-                None => {
-                    playlists.push((playlist.clone(), Vec::new()));
-                    playlists.len() - 1
-                }
-            };
-            playlists[index].1.push(filename);
+            ui.track_completed(&track.id);
 
-            Self::write_playlist_file(&options.destination, &playlist, &playlists[index].1).await?;
+            for playlist in ui.playlists_of(&track.id) {
+                let index = match playlist_files
+                    .iter()
+                    .position(|(name, _)| name == &playlist)
+                {
+                    Some(index) => index,
+                    None => {
+                        playlist_files.push((playlist.clone(), Vec::new()));
+                        playlist_files.len() - 1
+                    }
+                };
+                playlist_files[index].1.push(filename.clone());
+
+                Self::write_playlist_file(
+                    &options.destination,
+                    &playlist,
+                    &playlist_files[index].1,
+                )
+                .await?;
+            }
         }
+        ui.finish();
         Ok(())
     }
 
@@ -121,12 +143,18 @@ impl Downloader {
 
     #[tracing::instrument(
         name = "download_track",
-        skip(self, track, options),
+        skip(self, track, options, ui),
         fields(track = %track.id)
     )]
-    async fn download_track(&self, track: &Track, options: &DownloadOptions) -> Result<String> {
+    async fn download_track(
+        &self,
+        track: &Track,
+        options: &DownloadOptions,
+        ui: &DownloadUi,
+    ) -> Result<String> {
         let metadata = track.metadata(&self.session).await?;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
+        ui.track_metadata(metadata.to_string(), metadata.approx_size() as u64);
 
         let relative_path = format!(
             "{}.{}",
@@ -156,32 +184,28 @@ impl Downloader {
             }
         }
 
-        let pb = self.add_progress_bar(&metadata);
-
         let stream = Stream::new(self.session.clone());
         let channel = match stream.stream(track).await {
             Ok(channel) => channel,
             Err(e) => {
-                self.fail_with_error(&pb, &metadata.to_string(), e.to_string());
+                tracing::error!("Failed to download {}: {}", metadata.to_string(), e);
                 return Ok("".to_string());
             }
         };
 
-        let samples = match self.buffer_track(channel, &pb, &metadata).await {
+        let samples = match self.buffer_track(channel, ui, &metadata).await {
             Ok(samples) => samples,
             Err(e) => {
-                self.fail_with_error(&pb, &metadata.to_string(), e.to_string());
+                tracing::error!("Failed to download {}: {}", metadata.to_string(), e);
                 return Ok("".to_string());
             }
         };
 
         tracing::info!("Encoding track: {}", metadata.to_string());
-        pb.set_message(format!("Encoding {}", metadata.to_string()));
 
         let encoder = crate::encoder::get_encoder(options.format);
         let stream = encoder.encode(samples).await?;
 
-        pb.set_message(format!("Writing {}", metadata.to_string()));
         tracing::info!(
             "Writing track: {:?} to file: {}",
             metadata.to_string(),
@@ -192,28 +216,13 @@ impl Downloader {
         let tags = metadata.tags().await?;
         encoder::tags::store_tags(path, &tags, options.format).await?;
 
-        pb.finish_with_message(format!("Downloaded {}", metadata.to_string()));
         Ok(relative_path)
-    }
-
-    fn add_progress_bar(&self, track: &TrackMetadata) -> ProgressBar {
-        let pb = self
-            .progress_bar
-            .add(ProgressBar::new(track.approx_size() as u64));
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-            // Infallible
-            .unwrap()
-            .with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-            .progress_chars("#>-"));
-        pb.set_message(track.to_string());
-        pb
     }
 
     async fn buffer_track(
         &self,
         mut rx: StreamEventChannel,
-        pb: &ProgressBar,
+        ui: &DownloadUi,
         metadata: &TrackMetadata,
     ) -> Result<Samples> {
         let mut samples = Vec::<i32>::new();
@@ -225,7 +234,7 @@ impl Downloader {
                     mut content,
                 } => {
                     tracing::trace!("Written {} bytes out of {}", bytes, total);
-                    pb.set_position(bytes as u64);
+                    ui.track_bytes(bytes as u64);
                     samples.append(&mut content);
                 }
                 StreamEvent::Finished => {
@@ -246,12 +255,6 @@ impl Downloader {
                         max_attempts,
                         metadata.to_string()
                     );
-                    pb.set_message(format!(
-                        "Retrying ({}/{}) {}",
-                        attempt,
-                        max_attempts,
-                        metadata.to_string()
-                    ));
                 }
             }
         }
@@ -259,17 +262,5 @@ impl Downloader {
             samples,
             ..Default::default()
         })
-    }
-
-    fn fail_with_error<S>(&self, pb: &ProgressBar, name: &str, e: S)
-    where
-        S: Into<String>,
-    {
-        tracing::error!("Failed to download {}: {}", name, e.into());
-        pb.finish_with_message(
-            console::style(format!("Failed! {}", name))
-                .red()
-                .to_string(),
-        );
     }
 }

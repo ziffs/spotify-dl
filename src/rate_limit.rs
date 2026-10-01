@@ -83,6 +83,18 @@ struct PersistedState {
     last_refill_epoch_ms: u64,
 }
 
+/// A snapshot of the rate limiter's budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateLimitStatus {
+    /// Full download tokens currently available.
+    pub remaining: u32,
+    /// Burst capacity (the maximum budget).
+    pub capacity: u32,
+    /// Time until the next full token is available (zero if one is available
+    /// now or the budget is full).
+    pub next_token_in: Duration,
+}
+
 impl PersistentRateLimiter {
     /// Create a limiter backed by the state file at `state_path`.
     ///
@@ -149,6 +161,36 @@ impl PersistentRateLimiter {
             limiter,
             tracked: Mutex::new(tracked),
         })
+    }
+
+    /// The current budget, with the refill up to the current time applied.
+    pub fn status(&self) -> RateLimitStatus {
+        let max = self.config.max_downloads.get();
+        let tokens = {
+            let tracked = self
+                .tracked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            refill(
+                tracked.tokens,
+                tracked.last_refill_epoch_ms,
+                current_epoch_ms(),
+                max as f64,
+                self.config.period.as_secs_f64(),
+            )
+        };
+
+        let next_token_in = if tokens >= max as f64 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64((tokens.ceil() - tokens) * self.config.period.as_secs_f64())
+        };
+
+        RateLimitStatus {
+            remaining: tokens.floor() as u32,
+            capacity: max,
+            next_token_in,
+        }
     }
 
     /// Wait until the rate limiter allows another download, then record the

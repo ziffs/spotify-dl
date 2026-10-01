@@ -23,6 +23,7 @@ use ratatui::widgets::ListState;
 use ratatui::widgets::Paragraph;
 
 use crate::account::Folder;
+use crate::log;
 
 /// How long to wait for a key event before redrawing.
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
@@ -471,12 +472,14 @@ pub(crate) fn run(
     persist: &mut dyn FnMut(&HashSet<String>),
     refresh: &mut dyn FnMut() -> Result<(Folder, HashMap<String, String>)>,
 ) -> Result<Outcome> {
+    log::set_tui_active(true);
     let mut terminal = ratatui::init();
     let picker = FolderPicker::new(root, names)
         .with_pre_checked(pre_checked)
         .with_downloaded(downloaded);
     let result = event_loop(&mut terminal, picker, persist, refresh);
     ratatui::restore();
+    log::set_tui_active(false);
     result
 }
 

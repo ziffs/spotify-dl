@@ -1,7 +1,9 @@
 use spotify_dl::account::AccountSource;
 use spotify_dl::account::mark_playlists_downloaded;
 use spotify_dl::account::select_folder_playlists;
-use spotify_dl::download::{DownloadOptions, Downloader};
+use spotify_dl::download::DownloadOptions;
+use spotify_dl::download::Downloader;
+use spotify_dl::download_ui;
 use spotify_dl::encoder::Format;
 use spotify_dl::lock::InstanceLock;
 use spotify_dl::log;
@@ -144,19 +146,35 @@ async fn main() -> anyhow::Result<()> {
 
     let track = get_tracks(tracks, &session).await?;
 
-    let downloader = Downloader::new(session);
-    downloader
-        .download_tracks(
-            track,
-            &DownloadOptions::new(
-                opt.destination,
-                opt.format,
-                opt.force,
-                !opt.no_rate_limit,
-                rate_limiter,
-            ),
-        )
-        .await?;
+    // The download runs as a task while a dedicated thread renders the
+    // download view; the view exits when the task finishes.
+    let ui = download_ui::DownloadUi::new(&track);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
+    let download_options = DownloadOptions::new(
+        opt.destination,
+        opt.format,
+        opt.force,
+        !opt.no_rate_limit,
+        rate_limiter.clone(),
+    );
+
+    let download_ui_handle = ui.clone();
+    let download_task = tokio::spawn(async move {
+        let downloader = Downloader::new(session);
+        let result = downloader
+            .download_tracks(track, &download_options, &download_ui_handle)
+            .await;
+        let _ = finished_tx.send(());
+        result
+    });
+
+    let tui_task = tokio::task::spawn_blocking(move || {
+        download_ui::run_tui(ui.clone(), rate_limiter, finished_rx)
+    });
+
+    let (download_result, tui_result) = tokio::join!(download_task, tui_task);
+    tui_result.map_err(|err| anyhow::anyhow!("download view crashed: {err}"))??;
+    download_result.map_err(|err| anyhow::anyhow!("download task crashed: {err}"))??;
 
     // Record the downloaded status once the run has finished, so the picker
     // can show which playlists are already on disk.
