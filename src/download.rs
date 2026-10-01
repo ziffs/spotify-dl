@@ -1,7 +1,7 @@
 use std::fmt::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time;
 
 use anyhow::Result;
 use indicatif::MultiProgress;
@@ -13,6 +13,7 @@ use librespot::core::session::Session;
 use crate::encoder;
 use crate::encoder::Format;
 use crate::encoder::Samples;
+use crate::rate_limit::PersistentRateLimiter;
 use crate::stream::Stream;
 use crate::stream::StreamEvent;
 use crate::stream::StreamEventChannel;
@@ -30,10 +31,17 @@ pub struct DownloadOptions {
     pub format: Format,
     pub force: bool,
     pub rate_limit: bool,
+    pub rate_limiter: Option<Arc<PersistentRateLimiter>>,
 }
 
 impl DownloadOptions {
-    pub fn new(destination: Option<String>, format: Format, force: bool, rate_limit: bool) -> Self {
+    pub fn new(
+        destination: Option<String>,
+        format: Format,
+        force: bool,
+        rate_limit: bool,
+        rate_limiter: Option<Arc<PersistentRateLimiter>>,
+    ) -> Self {
         let destination =
             destination.map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
         DownloadOptions {
@@ -41,6 +49,7 @@ impl DownloadOptions {
             format,
             force,
             rate_limit,
+            rate_limiter,
         }
     }
 }
@@ -59,14 +68,15 @@ impl Downloader {
         options: &DownloadOptions,
     ) -> Result<()> {
         if options.rate_limit {
-            tracing::info!("Rate limiting enabled: downloading one track every minute");
+            tracing::info!("Rate limiting enabled: at most 30 downloads per 30 minutes");
         }
 
         let mut filenames = Vec::new();
-        for (index, track) in tracks.into_iter().enumerate() {
-            if index > 0 && options.rate_limit {
-                tracing::info!("Rate limiting: waiting 1 minute before next download...");
-                time::sleep(Duration::from_secs(60)).await;
+        for track in tracks.into_iter() {
+            if options.rate_limit {
+                if let Some(rate_limiter) = &options.rate_limiter {
+                    rate_limiter.acquire().await?;
+                }
             }
 
             let filename = match self.download_track(&track, options).await {
@@ -246,32 +256,5 @@ impl Downloader {
                 .red()
                 .to_string(),
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Instant;
-
-    #[tokio::test]
-    async fn test_rate_limiting() {
-        // Create a mock downloader and options
-        let _options = DownloadOptions {
-            destination: PathBuf::from("/tmp"),
-            format: Format::Flac,
-            force: false,
-            rate_limit: true,
-        };
-
-        // Create a mock session (this would need to be properly mocked in a real test)
-        // For now, we'll just test the rate limiting logic
-        let start = Instant::now();
-
-        // Simulate the rate limiting delay
-        time::sleep(Duration::from_secs(1)).await; // Use 1 second for testing instead of 2 minutes
-
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_secs(1));
     }
 }

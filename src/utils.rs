@@ -16,7 +16,7 @@ where
 
 const DOT_PATH: &str = ".spotify-dl";
 
-pub(crate) fn get_dot_path() -> Result<PathBuf> {
+pub fn get_dot_path() -> Result<PathBuf> {
     let path = dirs::home_dir()
         .map(|p| p.join(DOT_PATH))
         .ok_or(anyhow::anyhow!("Could not find home directory"))?;

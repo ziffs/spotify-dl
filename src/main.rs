@@ -1,8 +1,12 @@
 use spotify_dl::download::{DownloadOptions, Downloader};
 use spotify_dl::encoder::Format;
+use spotify_dl::lock::InstanceLock;
 use spotify_dl::log;
+use spotify_dl::rate_limit::{PersistentRateLimiter, RateLimitConfig};
 use spotify_dl::session::create_session;
 use spotify_dl::track::get_tracks;
+use spotify_dl::utils::get_dot_path;
+use std::sync::Arc;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -38,7 +42,7 @@ struct Opt {
     #[structopt(
         short = "r",
         long = "no-rate-limit",
-        help = "Don't rate limit downloads to one track every minute"
+        help = "Don't rate limit downloads (at most 30 downloads per 30 minutes)"
     )]
     no_rate_limit: bool,
 }
@@ -58,6 +62,25 @@ async fn main() -> anyhow::Result<()> {
     log::configure_logger()?;
 
     let opt = Opt::from_args();
+
+    let dot_path = get_dot_path()?;
+    let _instance_lock = match InstanceLock::acquire(dot_path.join("spotify-dl.lock")) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("Another spotify-dl instance appears to be running: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let rate_limiter = if opt.no_rate_limit {
+        None
+    } else {
+        Some(Arc::new(PersistentRateLimiter::new(
+            dot_path.join("download_rate_limit.json"),
+            RateLimitConfig::default(),
+        )?))
+    };
+
     create_destination_if_required(opt.destination.clone())?;
 
     if opt.tracks.is_empty() {
@@ -73,7 +96,13 @@ async fn main() -> anyhow::Result<()> {
     downloader
         .download_tracks(
             track,
-            &DownloadOptions::new(opt.destination, opt.format, opt.force, !opt.no_rate_limit),
+            &DownloadOptions::new(
+                opt.destination,
+                opt.format,
+                opt.force,
+                !opt.no_rate_limit,
+                rate_limiter,
+            ),
         )
         .await
 }

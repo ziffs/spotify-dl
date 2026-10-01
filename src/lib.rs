@@ -6,4 +6,4 @@ pub mod rate_limit;
 pub mod session;
 pub mod stream;
 pub mod track;
-mod utils;
+pub mod utils;
