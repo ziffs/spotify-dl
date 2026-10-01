@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,42 +72,50 @@ impl Downloader {
             tracing::info!("Rate limiting enabled: at most 30 downloads per 30 minutes");
         }
 
-        let mut filenames = Vec::new();
+        let mut playlists: Vec<(String, Vec<String>)> = Vec::new();
         for track in tracks.into_iter() {
             let filename = match self.download_track(&track, options).await {
                 Err(err) => {
                     tracing::warn!("Error in track {:?}: {:?}", track.id, err);
-                    "".to_string()
+                    continue;
                 }
+                Ok(filename) if filename.is_empty() => continue,
                 Ok(filename) => filename,
             };
-            filenames.push((track.source_playlist.clone(), filename));
-        }
-
-        let mut playlists: Vec<(String, Vec<String>)> = Vec::new();
-        for (source_playlist, filename) in filenames {
-            let Some(playlist) = source_playlist else {
+            let Some(playlist) = track.source_playlist else {
                 continue;
             };
-            if filename.is_empty() {
-                continue;
-            }
-            match playlists.iter_mut().find(|(name, _)| name == &playlist) {
-                Some((_, entries)) => entries.push(filename),
-                None => playlists.push((playlist, vec![filename])),
-            }
-        }
+            let index = match playlists.iter().position(|(name, _)| name == &playlist) {
+                Some(index) => index,
+                None => {
+                    playlists.push((playlist.clone(), Vec::new()));
+                    playlists.len() - 1
+                }
+            };
+            playlists[index].1.push(filename);
 
-        for (playlist, entries) in playlists {
-            let mut content = String::from("#EXTM3U\n");
-            for entry in entries {
-                content.push_str(&entry);
-                content.push('\n');
-            }
-            let playlist_file = options.destination.join(format!("{}.m3u", playlist));
-            tokio::fs::write(&playlist_file, content).await?;
-            tracing::info!("Wrote playlist file: {:?}", playlist_file);
+            Self::write_playlist_file(&options.destination, &playlist, &playlists[index].1).await?;
         }
+        Ok(())
+    }
+
+    async fn write_playlist_file(
+        destination: &Path,
+        playlist: &str,
+        entries: &[String],
+    ) -> Result<()> {
+        let mut content = String::from("#EXTM3U\n");
+        for entry in entries {
+            content.push_str(entry);
+            content.push('\n');
+        }
+        let playlist_file = destination.join(format!("{}.m3u", playlist));
+        tokio::fs::write(&playlist_file, content).await?;
+        tracing::info!(
+            "Updated playlist file: {:?} ({} entries)",
+            playlist_file,
+            entries.len()
+        );
         Ok(())
     }
 
