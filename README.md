@@ -11,7 +11,7 @@ A command line utility to download songs, podcasts, playlists and albums directl
 ## 🚀 Features
 
 - Download individual tracks, podcasts, playlists or full albums.
-- Download entire playlist folders from your account with an interactive picker.
+- Browse your account's playlist folders in an interactive tree view and pick individual playlists and/or whole folders to download.
 - Built with Rust for speed and efficiency.
 - Supports metadata tagging and organized file output.
 
@@ -59,7 +59,7 @@ ARGS:
 
 Songs, playlists and albums must be passed as Spotify URIs or URLs (e.g. `spotify:track:123456789abcdefghABCDEF` for songs and `spotify:playlist:123456789abcdefghABCDEF` for playlists or `https://open.spotify.com/playlist/123456789abcdefghABCDEF?si=1234567890`).
 
-Alternatively, pass `--from-account` (instead of any track arguments) to browse the playlist folders of the logged-in account: spotify-dl queries the folders and the playlists they contain, shows an interactive picker, and then downloads every playlist of the selected folder as if you had passed them all as arguments.
+Alternatively, pass `--from-account` (instead of any track arguments) to browse the playlist folders of the logged-in account: spotify-dl queries the folders and the playlists they contain and shows a full-screen tree view where you can select/de-select individual playlists and/or whole folders (toggling a folder selects everything inside it, including nested folders). Confirming with Enter downloads every selected playlist as if you had passed them all as arguments.
 
 ## 📁 Output structure
 
@@ -102,7 +102,7 @@ Download a playlist with rate limiting:
 spotify-dl --rate-limit https://open.spotify.com/playlist/PLAYLIST_ID
 ```
 
-Download a whole playlist folder from your account (interactive picker):
+Download playlists from your account (interactive tree view — pick playlists or whole folders):
 
 ```
 spotify-dl --from-account

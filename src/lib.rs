@@ -1,6 +1,7 @@
 pub mod account;
 pub mod download;
 pub mod encoder;
+pub(crate) mod folder_picker;
 pub mod lock;
 pub mod log;
 pub mod rate_limit;

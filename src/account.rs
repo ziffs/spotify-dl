@@ -1,13 +1,20 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use anyhow::anyhow;
-use dialoguer::Select;
-use dialoguer::theme::ColorfulTheme;
+use futures::StreamExt;
+use librespot::core::SpotifyUri;
 use librespot::core::session::Session;
 use librespot::core::spotify_id::SpotifyId;
+use librespot::metadata::Metadata;
+use librespot::metadata::Playlist;
 use librespot::protocol::playlist4_external::SelectedListContent;
 use protobuf::Message;
+
+use crate::folder_picker;
 
 /// Number of rootlist entries requested per page.
 const ROOTLIST_PAGE_SIZE: usize = 500;
@@ -15,18 +22,10 @@ const ROOTLIST_PAGE_SIZE: usize = 500;
 const MAX_ROOTLIST_ITEMS: usize = 10_000;
 
 #[derive(Debug, Default)]
-struct Folder {
-    name: String,
-    playlists: Vec<String>,
-    children: Vec<Folder>,
-}
-
-/// A folder flattened out of the account's folder tree, with the playlists it
-/// contains recursively (directly or through nested folders).
-struct FolderEntry {
-    name: String,
-    depth: usize,
-    playlists: Vec<String>,
+pub(crate) struct Folder {
+    pub(crate) name: String,
+    pub(crate) playlists: Vec<String>,
+    pub(crate) children: Vec<Folder>,
 }
 
 enum RootlistItem {
@@ -36,71 +35,37 @@ enum RootlistItem {
     Other,
 }
 
-/// Queries the account's rootlist (the sidebar contents) and lets the user pick
-/// one of its playlist folders interactively.
-///
-/// Returns the Spotify playlist URIs contained in the selected folder, so the
-/// caller can proceed as if the user had passed them as download arguments.
+/// Queries the account's rootlist (the sidebar contents), shows an interactive
+/// tree view of its folders and playlists, and returns the URIs the user
+/// selected, so the caller can proceed as if they had been passed as download
+/// arguments.
 pub async fn select_folder_playlists(session: &Session) -> Result<Vec<String>> {
     let uris = fetch_rootlist_uris(session).await?;
     let root = build_folder_tree(&uris);
 
-    // Only actual folders are selectable; playlists left loose at the root of
-    // the sidebar are out of scope here.
-    let mut entries = Vec::new();
-    for folder in &root.children {
-        flatten_folders(folder, 0, &mut entries);
-    }
-    // Folders without any (recursive) playlist cannot be downloaded.
-    entries.retain(|entry| !entry.playlists.is_empty());
-
-    if entries.is_empty() {
+    let mut all_uris = Vec::new();
+    collect_all_uris(&root, &mut all_uris);
+    if all_uris.is_empty() {
         return Err(anyhow!(
-            "No playlist folders found in your account. \
+            "No playlists found in your account. \
              Pass playlist URIs or URLs as arguments instead."
         ));
     }
 
-    let items: Vec<String> = entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}{} ({} playlist{})",
-                "  ".repeat(entry.depth),
-                entry.name,
-                entry.playlists.len(),
-                if entry.playlists.len() == 1 { "" } else { "s" }
-            )
-        })
-        .collect();
+    let names = fetch_playlist_names(session, &dedupe(all_uris)).await;
 
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select a playlist folder to download")
-        .items(&items)
-        .default(0)
-        .interact_opt()
-        .map_err(|err| anyhow!("Failed to read folder selection: {}", err))?;
+    let selected = folder_picker::run(&root, names)?;
 
-    let Some(selection) = selection else {
-        return Err(anyhow!("No folder selected"));
-    };
-
-    let selected = &entries[selection];
     println!(
-        "Downloading {} playlist{} from folder \"{}\":",
-        selected.playlists.len(),
-        if selected.playlists.len() == 1 {
-            ""
-        } else {
-            "s"
-        },
-        selected.name
+        "Downloading {} playlist{}:",
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" }
     );
-    for playlist in &selected.playlists {
+    for playlist in &selected {
         println!("  - {}", playlist);
     }
 
-    Ok(selected.playlists.clone())
+    Ok(selected)
 }
 
 /// Fetches the account's rootlist, paginating until every entry has been read.
@@ -242,26 +207,56 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn collect_playlists_recursive(folder: &Folder, out: &mut Vec<String>) {
+/// Collects every playlist URI in the tree, in tree order (with duplicates).
+fn collect_all_uris(folder: &Folder, out: &mut Vec<String>) {
     out.extend(folder.playlists.iter().cloned());
     for child in &folder.children {
-        collect_playlists_recursive(child, out);
+        collect_all_uris(child, out);
     }
 }
 
-fn flatten_folders(folder: &Folder, depth: usize, out: &mut Vec<FolderEntry>) {
-    let mut playlists = Vec::new();
-    collect_playlists_recursive(folder, &mut playlists);
+/// Resolves the display names of the given playlists concurrently. Playlists
+/// whose name cannot be fetched are simply absent from the result (the picker
+/// falls back to showing their URI).
+async fn fetch_playlist_names(session: &Session, uris: &[String]) -> HashMap<String, String> {
+    const CONCURRENCY: usize = 16;
 
-    out.push(FolderEntry {
-        name: folder.name.clone(),
-        depth,
-        playlists: dedupe(playlists),
-    });
-
-    for child in &folder.children {
-        flatten_folders(child, depth + 1, out);
+    if uris.is_empty() {
+        return HashMap::new();
     }
+
+    let total = uris.len();
+    let fetched = &AtomicUsize::new(0);
+    eprint!("Fetching playlist names... 0/{total}");
+
+    let results = futures::stream::iter(uris.iter().map(|uri| {
+        let session = session.clone();
+        async move {
+            let name = playlist_name(&session, uri).await;
+            let done = fetched.fetch_add(1, Ordering::Relaxed) + 1;
+            eprint!("\rFetching playlist names... {done}/{total}");
+            (uri.clone(), name)
+        }
+    }))
+    .buffer_unordered(CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    eprintln!();
+
+    let mut names = HashMap::with_capacity(results.len());
+    for (uri, name) in results {
+        if let Some(name) = name {
+            names.insert(uri, name);
+        }
+    }
+    names
+}
+
+async fn playlist_name(session: &Session, uri: &str) -> Option<String> {
+    let parsed = SpotifyUri::from_uri(uri).ok()?;
+    let playlist = Playlist::get(session, &parsed).await.ok()?;
+    let name = playlist.attributes.name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn dedupe(uris: Vec<String>) -> Vec<String> {
@@ -354,40 +349,6 @@ mod tests {
 
         assert_eq!(root.children[1].name, "Empty");
         assert!(root.children[1].playlists.is_empty());
-    }
-
-    #[test]
-    fn flattening_collects_playlists_recursively() {
-        let root = build_folder_tree(&uris(&[
-            "spotify:start-group:aaaaaaaaaaaaaaaa:Work",
-            "spotify:playlist:37i9dQZF1DX0XUsuxWHRQd",
-            "spotify:start-group:bbbbbbbbbbbbbbbb:Gym",
-            "spotify:playlist:37i9dQZF1DX4sWSpwq3LiO",
-            "spotify:end-group:bbbbbbbbbbbbbbbb",
-            "spotify:end-group:aaaaaaaaaaaaaaaa",
-        ]));
-
-        let mut entries = Vec::new();
-        for folder in &root.children {
-            flatten_folders(folder, 0, &mut entries);
-        }
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "Work");
-        assert_eq!(entries[0].depth, 0);
-        assert_eq!(
-            entries[0].playlists,
-            uris(&[
-                "spotify:playlist:37i9dQZF1DX0XUsuxWHRQd",
-                "spotify:playlist:37i9dQZF1DX4sWSpwq3LiO",
-            ])
-        );
-        assert_eq!(entries[1].name, "Gym");
-        assert_eq!(entries[1].depth, 1);
-        assert_eq!(
-            entries[1].playlists,
-            uris(&["spotify:playlist:37i9dQZF1DX4sWSpwq3LiO"])
-        );
     }
 
     #[test]
