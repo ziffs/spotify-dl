@@ -80,7 +80,8 @@ fn memory_log() -> &'static Mutex<VecDeque<String>> {
 }
 
 fn push_memory_line(line: &str) {
-    if line.trim().is_empty() {
+    let line = line.trim();
+    if line.is_empty() {
         return;
     }
     let mut log = memory_log()
@@ -99,6 +100,52 @@ pub fn recent_lines(max: usize) -> Vec<String> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let start = log.len().saturating_sub(max);
     log.iter().skip(start).cloned().collect()
+}
+
+/// How many warnings/errors are replayed to the console when a TUI closes.
+const REPLAY_MAX: usize = 100;
+
+/// Restores console logging after a TUI closes and replays the warnings and
+/// errors that were logged while the TUI owned the terminal, so they are
+/// visible on the command line as well (the log file keeps all of them).
+pub fn end_tui() {
+    set_tui_active(false);
+
+    let lines = warnings_and_errors(usize::MAX);
+    if lines.is_empty() {
+        return;
+    }
+
+    let skipped = lines.len().saturating_sub(REPLAY_MAX);
+    if skipped > 0 {
+        println!("… {skipped} earlier warning(s)/error(s) omitted, see the log file");
+    }
+    for line in lines.iter().skip(skipped) {
+        println!("{line}");
+    }
+}
+
+/// The WARN and ERROR lines currently in the memory log, oldest first, at
+/// most `max` of them.
+fn warnings_and_errors(max: usize) -> Vec<String> {
+    let log = memory_log()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let warnings = log.iter().filter(|line| is_warning_or_error(line));
+    let total = warnings.count();
+    let start = total.saturating_sub(max);
+    log.iter()
+        .filter(|line| is_warning_or_error(line))
+        .skip(start)
+        .cloned()
+        .collect()
+}
+
+/// The memory log's lines start with the (right-aligned) level token, since
+/// the layer writes without timestamp and target.
+fn is_warning_or_error(line: &str) -> bool {
+    let level = line.trim_start();
+    level.starts_with("ERROR") || level.starts_with("WARN")
 }
 
 #[derive(Clone)]
@@ -345,5 +392,33 @@ mod tests {
         assert_eq!(civil_from_days(59), (1970, 3, 1));
         // 1972 is a leap year: Feb 29 is day 789 after the epoch.
         assert_eq!(civil_from_days(789), (1972, 2, 29));
+    }
+
+    #[test]
+    fn warnings_and_errors_are_filtered_and_capped() {
+        // Reset the shared memory log for this test.
+        *memory_log().lock().unwrap() = VecDeque::new();
+
+        push_memory_line(" INFO starting");
+        push_memory_line(
+            "ERROR download_track{track=x}: Failed to get metadata: Error { kind: InvalidArgument }",
+        );
+        push_memory_line(" WARN something odd");
+        push_memory_line(" INFO more context");
+        push_memory_line("ERROR second failure");
+
+        let all = warnings_and_errors(usize::MAX);
+        assert_eq!(all.len(), 3);
+        assert!(all[0].starts_with("ERROR"));
+        assert!(all[1].starts_with("WARN"));
+        assert!(all[2].starts_with("ERROR"));
+
+        // The cap keeps the most recent entries.
+        let capped = warnings_and_errors(2);
+        assert_eq!(capped.len(), 2);
+        assert!(capped[0].starts_with("WARN"));
+        assert!(capped[1].starts_with("ERROR"));
+
+        *memory_log().lock().unwrap() = VecDeque::new();
     }
 }

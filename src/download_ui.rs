@@ -317,7 +317,7 @@ pub fn run_tui(
 ) -> Result<()> {
     log::set_tui_active(true);
     let result = tui_loop(ui, rate_limiter, &mut finished);
-    log::set_tui_active(false);
+    log::end_tui();
     result
 }
 

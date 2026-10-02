@@ -507,7 +507,7 @@ pub(crate) fn run(
         refresh,
     );
     ratatui::restore();
-    log::set_tui_active(false);
+    log::end_tui();
     result
 }
 
