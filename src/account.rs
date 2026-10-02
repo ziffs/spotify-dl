@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -21,6 +22,8 @@ use crate::capture::CaptureStore;
 use crate::capture::MockStore;
 use crate::capture::ROOTLIST_PAGE_SIZE;
 use crate::folder_picker;
+use crate::folder_picker::LoadingProgress;
+use crate::folder_picker::LoadingStage;
 use crate::folder_picker::Outcome;
 
 /// Hard cap on rootlist entries, so a misbehaving server cannot make us loop forever.
@@ -33,6 +36,7 @@ const MAX_ROOTLIST_ITEMS: usize = 10_000;
 /// `SPOTIFY_DL_CAPTURE_DIR` environment variable); [`AccountSource::Mock`]
 /// serves previously captured and anonymized fixtures, running the whole
 /// flow offline.
+#[derive(Clone)]
 pub enum AccountSource {
     Live {
         session: Session,
@@ -112,27 +116,6 @@ enum RootlistItem {
 /// next start, and the cache is used when the account cannot be reached.
 pub async fn select_folder_playlists(source: &AccountSource) -> Result<Vec<String>> {
     let cached = AccountState::load().filter(|state| state.has_playlists());
-
-    let (root, mut names) = match fetch_account_data(source, false).await {
-        Ok(data) => data,
-        Err(err) => match &cached {
-            Some(state) => {
-                eprintln!(
-                    "Warning: could not refresh from account ({err:#}); showing cached playlists."
-                );
-                (state.root.clone(), state.names.clone())
-            }
-            None => return Err(err),
-        },
-    };
-
-    // Cached names fill gaps for playlists whose name could not be fetched.
-    if let Some(state) = &cached {
-        for (uri, name) in &state.names {
-            names.entry(uri.clone()).or_insert_with(|| name.clone());
-        }
-    }
-
     let pre_checked: HashSet<String> = cached
         .as_ref()
         .map(|state| state.selected.iter().cloned().collect())
@@ -142,25 +125,54 @@ pub async fn select_folder_playlists(source: &AccountSource) -> Result<Vec<Strin
         .map(|state| state.downloaded.clone())
         .unwrap_or_default();
 
-    let mut state = AccountState {
-        root: root.clone(),
-        names: names.clone(),
-        selected: pre_checked.iter().cloned().collect(),
-        downloaded: downloaded.clone(),
-    };
-    state.selected.sort();
-    state.save()?;
+    // The initial metadata load runs in the background; the picker shows its
+    // progress and switches to the tree view once it arrives.
+    let progress: LoadingProgress = Default::default();
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+    let fetch_source = source.clone();
+    let fetch_progress = progress.clone();
+    tokio::spawn(async move {
+        let result = match fetch_account_data(&fetch_source, &fetch_progress).await {
+            Ok((root, names)) => {
+                // Refresh the cache with the fresh tree and names, keeping the
+                // selection and downloaded status.
+                let mut state = AccountState::load().unwrap_or_default();
+                state.root = root.clone();
+                state.names = names.clone();
+                state.selected.sort();
+                if let Err(err) = state.save() {
+                    tracing::warn!("Could not refresh the account cache: {err:#}");
+                }
+                Ok((root, names))
+            }
+            Err(err) => match AccountState::load().filter(|state| state.has_playlists()) {
+                Some(state) => {
+                    tracing::warn!(
+                        "Could not refresh from account ({err:#}); showing cached playlists"
+                    );
+                    Ok((state.root, state.names))
+                }
+                None => Err(err),
+            },
+        };
+        let _ = loaded_tx.send(result);
+    });
 
     let handle = tokio::runtime::Handle::current();
-    let mut refresh =
-        move || tokio::task::block_in_place(|| handle.block_on(fetch_account_data(source, true)));
+    let refresh_progress = progress.clone();
+    let mut refresh = move || {
+        tokio::task::block_in_place(|| {
+            handle.block_on(fetch_account_data(source, &refresh_progress))
+        })
+    };
 
     let outcome = folder_picker::run(
-        &root,
-        names,
+        progress,
+        loaded_rx,
         pre_checked,
         downloaded,
         &mut |checked: &HashSet<String>| {
+            let mut state = AccountState::load().unwrap_or_default();
             state.selected = checked.iter().cloned().collect();
             state.selected.sort();
             if let Err(err) = state.save() {
@@ -172,7 +184,10 @@ pub async fn select_folder_playlists(source: &AccountSource) -> Result<Vec<Strin
 
     match outcome {
         Outcome::Selected(selected) => {
+            // Persist the exact selection that is about to be downloaded.
+            let mut state = AccountState::load().unwrap_or_default();
             state.selected = selected.clone();
+            state.selected.sort();
             state.save()?;
 
             println!(
@@ -200,8 +215,11 @@ pub fn mark_playlists_downloaded(uris: &[String]) -> Result<()> {
 /// Fetches the folder tree and the playlist display names from the account.
 pub async fn fetch_account_data(
     source: &AccountSource,
-    quiet: bool,
+    progress: &LoadingProgress,
 ) -> Result<(Folder, HashMap<String, String>)> {
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = LoadingStage::Rootlist;
     let uris = fetch_rootlist_uris(source).await?;
     let root = build_folder_tree(&uris);
 
@@ -213,8 +231,15 @@ pub async fn fetch_account_data(
              Pass playlist URIs or URLs as arguments instead."
         ));
     }
+    let all_uris = dedupe(all_uris);
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = LoadingStage::Names {
+        done: 0,
+        total: all_uris.len(),
+    };
 
-    let names = fetch_playlist_names(source, &dedupe(all_uris), quiet).await;
+    let names = fetch_playlist_names(source, &all_uris, progress).await;
     Ok((root, names))
 }
 
@@ -368,7 +393,7 @@ pub(crate) fn collect_all_uris(folder: &Folder, out: &mut Vec<String>) {
 async fn fetch_playlist_names(
     source: &AccountSource,
     uris: &[String],
-    quiet: bool,
+    progress: &LoadingProgress,
 ) -> HashMap<String, String> {
     const CONCURRENCY: usize = 16;
 
@@ -377,25 +402,27 @@ async fn fetch_playlist_names(
     }
 
     let total = uris.len();
-    let fetched = &AtomicUsize::new(0);
-    if !quiet {
-        eprint!("Fetching playlist names... 0/{total}");
-    }
+    let fetched = Arc::new(AtomicUsize::new(0));
 
-    let results = futures::stream::iter(uris.iter().map(|uri| async move {
-        let name = playlist_name(source, uri).await;
-        let done = fetched.fetch_add(1, Ordering::Relaxed) + 1;
-        if !quiet {
-            eprint!("\rFetching playlist names... {done}/{total}");
+    // The per-playlist futures own their captures so the stream stays
+    // lifetime-general under `buffer_unordered`.
+    let results = futures::stream::iter(uris.iter().cloned().map(|uri: String| {
+        let source = source.clone();
+        let progress = progress.clone();
+        let fetched = fetched.clone();
+        async move {
+            let name = playlist_name(&source, &uri).await;
+            let done = fetched.fetch_add(1, Ordering::Relaxed) + 1;
+            *progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                LoadingStage::Names { done, total };
+            (uri, name)
         }
-        (uri.clone(), name)
     }))
     .buffer_unordered(CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
-    if !quiet {
-        eprintln!();
-    }
 
     let mut names = HashMap::with_capacity(results.len());
     for (uri, name) in results {

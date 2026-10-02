@@ -1,13 +1,19 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use anyhow::Result;
+use anyhow::anyhow;
 use ratatui::crossterm::event as crossterm_event;
 use ratatui::crossterm::event::Event;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::crossterm::event::KeyEventKind;
+use ratatui::crossterm::event::KeyModifiers;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::style::Color;
@@ -17,6 +23,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
+use ratatui::widgets::Gauge;
 use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
 use ratatui::widgets::ListState;
@@ -26,8 +33,6 @@ use crate::account::Folder;
 use crate::log;
 
 /// How long to wait for a key event before redrawing.
-const POLL_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// A row of the tree view: either a folder (which toggles everything inside it)
 /// or a single playlist.
 #[derive(Debug, Clone)]
@@ -76,6 +81,23 @@ pub enum RowKind {
     Folder,
     Playlist,
 }
+
+/// How often the picker redraws and polls for keys.
+const TICK: Duration = Duration::from_millis(200);
+
+/// Progress of the initial account metadata fetch, shown inside the picker
+/// while it loads.
+#[derive(Debug, Default, Clone)]
+pub enum LoadingStage {
+    /// Fetching the rootlist (the folder tree).
+    #[default]
+    Rootlist,
+    /// Fetching the display name of every playlist.
+    Names { done: usize, total: usize },
+}
+
+/// Shared slot the metadata fetch task reports its progress through.
+pub type LoadingProgress = Arc<Mutex<LoadingStage>>;
 
 /// Interactive tree view over the account's playlist folders.
 ///
@@ -193,6 +215,7 @@ impl FolderPicker {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
             KeyCode::Home | KeyCode::Char('g') => self.move_home(),
@@ -458,15 +481,15 @@ impl FolderPicker {
     }
 }
 
-/// Shows the tree view and returns the outcome once the user leaves it with
-/// Enter (selection) or Esc/q (cancel).
+/// Shows the picker: first the metadata loading progress, then the tree view.
 ///
+/// The account data arrives through `loaded` (fetched in the background);
 /// `persist` is called whenever the selection changes, so an abort keeps the
 /// selection for the next run. `refresh` re-fetches the account's tree and
 /// playlist names (triggered with `R`); the picker is updated in place.
 pub(crate) fn run(
-    root: &Folder,
-    names: HashMap<String, String>,
+    progress: LoadingProgress,
+    mut loaded: mpsc::Receiver<Result<(Folder, HashMap<String, String>)>>,
     pre_checked: HashSet<String>,
     downloaded: HashMap<String, u64>,
     persist: &mut dyn FnMut(&HashSet<String>),
@@ -474,10 +497,15 @@ pub(crate) fn run(
 ) -> Result<Outcome> {
     log::set_tui_active(true);
     let mut terminal = ratatui::init();
-    let picker = FolderPicker::new(root, names)
-        .with_pre_checked(pre_checked)
-        .with_downloaded(downloaded);
-    let result = event_loop(&mut terminal, picker, persist, refresh);
+    let result = event_loop(
+        &mut terminal,
+        progress,
+        &mut loaded,
+        pre_checked,
+        downloaded,
+        persist,
+        refresh,
+    );
     ratatui::restore();
     log::set_tui_active(false);
     result
@@ -485,39 +513,152 @@ pub(crate) fn run(
 
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    mut picker: FolderPicker,
+    progress: LoadingProgress,
+    loaded: &mut mpsc::Receiver<Result<(Folder, HashMap<String, String>)>>,
+    pre_checked: HashSet<String>,
+    downloaded: HashMap<String, u64>,
     persist: &mut dyn FnMut(&HashSet<String>),
     refresh: &mut dyn FnMut() -> Result<(Folder, HashMap<String, String>)>,
 ) -> Result<Outcome> {
-    let mut saved_checked = picker.checked().clone();
+    // `None` while the initial metadata is loading.
+    let mut picker: Option<FolderPicker> = None;
+    let mut saved_checked: Option<HashSet<String>> = None;
+    let started = std::time::Instant::now();
+
     loop {
-        terminal.draw(|frame| draw(frame, &picker))?;
-        if !crossterm_event::poll(POLL_TIMEOUT)? {
-            continue;
-        }
-        if let Event::Key(key) = crossterm_event::read()? {
-            picker.handle_key(key);
-            if picker.should_submit() {
-                return Ok(Outcome::Selected(picker.selected_uris()));
-            }
-            if picker.should_quit() {
-                return Ok(Outcome::Cancelled);
-            }
-            if picker.take_refresh() {
-                picker.set_status(Some("Refreshing metadata from account...".to_string()));
-                terminal.draw(|frame| draw(frame, &picker))?;
-                match refresh() {
-                    Ok((root, names)) => picker.update(root, names),
-                    Err(err) => picker.set_status(Some(format!("Refresh failed: {err:#}"))),
+        terminal.draw(|frame| match &picker {
+            Some(picker) => draw(frame, picker),
+            None => draw_loading(frame, &progress, started),
+        })?;
+
+        // Keys: everything while the tree is shown; only quit while loading.
+        // A failing event poll (no controlling terminal) is not fatal.
+        let mut quit_requested = false;
+        match crossterm_event::poll(TICK) {
+            Ok(true) => {
+                if let Event::Key(key) = crossterm_event::read()?
+                    && key.kind == KeyEventKind::Press
+                {
+                    match &mut picker {
+                        Some(active) => active.handle_key(key),
+                        None => {
+                            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                                || (key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL))
+                            {
+                                quit_requested = true;
+                            }
+                        }
+                    }
                 }
             }
-            if picker.checked() != &saved_checked {
-                saved_checked = picker.checked().clone();
-                persist(&saved_checked);
+            Ok(false) => {}
+            Err(_) => std::thread::sleep(TICK),
+        }
+        if quit_requested {
+            return Ok(Outcome::Cancelled);
+        }
+
+        let Some(active) = picker.as_mut() else {
+            // Still loading: watch for the account data to arrive.
+            match loaded.try_recv() {
+                Ok(Ok((root, names))) => {
+                    let loaded_picker = FolderPicker::new(&root, names)
+                        .with_pre_checked(pre_checked.clone())
+                        .with_downloaded(downloaded.clone());
+                    saved_checked = Some(loaded_picker.checked().clone());
+                    picker = Some(loaded_picker);
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(anyhow!("the account metadata task ended unexpectedly"));
+                }
+                Err(TryRecvError::Empty) => {}
             }
+            continue;
+        };
+
+        if active.should_submit() {
+            return Ok(Outcome::Selected(active.selected_uris()));
+        }
+        if active.should_quit() {
+            return Ok(Outcome::Cancelled);
+        }
+        if active.take_refresh() {
+            active.set_status(Some("Refreshing metadata from account...".to_string()));
+            terminal.draw(|frame| draw(frame, active))?;
+            match refresh() {
+                Ok((root, names)) => active.update(root, names),
+                Err(err) => active.set_status(Some(format!("Refresh failed: {err:#}"))),
+            }
+        }
+        if active.checked() != saved_checked.as_ref().unwrap_or(&HashSet::new()) {
+            saved_checked = Some(active.checked().clone());
+            persist(active.checked());
         }
     }
 }
+
+fn ratio(done: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn draw_loading(
+    frame: &mut ratatui::Frame,
+    progress: &LoadingProgress,
+    started: std::time::Instant,
+) {
+    let area = frame.area();
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let centered = Layout::vertical([
+        Constraint::Percentage(40),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Percentage(40),
+    ])
+    .split(chunks[0]);
+
+    let stage = progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+
+    let spinner = SPINNER[(started.elapsed().as_millis() / 120) as usize % SPINNER.len()];
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(spinner.to_string(), Style::default().fg(Color::Cyan)),
+            Span::raw(" Loading your playlists…"),
+        ])),
+        centered[1],
+    );
+
+    let (stage_line, gauge) = match &stage {
+        LoadingStage::Rootlist => (
+            Line::from("Fetching playlists from your account…"),
+            Gauge::default()
+                .label("Fetching playlists…")
+                .gauge_style(Style::default().fg(Color::Cyan)),
+        ),
+        LoadingStage::Names { done, total } => (
+            Line::from(format!("Fetching playlist names… {done}/{total}")),
+            Gauge::default()
+                .ratio(ratio(*done, *total))
+                .label(format!("Playlist names {done}/{total}"))
+                .gauge_style(Style::default().fg(Color::Cyan)),
+        ),
+    };
+    frame.render_widget(Paragraph::new(stage_line), centered[2]);
+    frame.render_widget(gauge, centered[3]);
+
+    frame.render_widget(Paragraph::new(Line::from("esc cancel")), chunks[1]);
+}
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 fn draw(frame: &mut ratatui::Frame, picker: &FolderPicker) {
     let chunks = Layout::vertical([
@@ -1067,6 +1208,42 @@ mod tests {
         assert!(content.contains("[ ] spotify:playlist:loose"));
         assert!(content.contains("▾ [ ] Empty (0 playlists)"));
         assert!(content.contains("space toggle"));
+    }
+
+    #[test]
+    fn renders_loading_screen_with_progress() {
+        let progress: LoadingProgress = Default::default();
+        *progress.lock().unwrap() = LoadingStage::Names {
+            done: 42,
+            total: 129,
+        };
+        let started = std::time::Instant::now();
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| draw_loading(frame, &progress, started))
+            .unwrap();
+        let content = buffer_content(terminal.backend().buffer());
+
+        assert!(content.contains("Loading your playlists…"));
+        assert!(content.contains("Fetching playlist names… 42/129"));
+        assert!(content.contains("Playlist names 42/129"));
+        assert!(content.contains("esc cancel"));
+    }
+
+    #[test]
+    fn renders_rootlist_loading_stage() {
+        let progress: LoadingProgress = Default::default();
+        let started = std::time::Instant::now();
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| draw_loading(frame, &progress, started))
+            .unwrap();
+        let content = buffer_content(terminal.backend().buffer());
+
+        assert!(content.contains("Fetching playlists from your account…"));
+        assert!(content.contains("Fetching playlists…"));
     }
 
     #[test]

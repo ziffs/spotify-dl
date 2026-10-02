@@ -42,6 +42,7 @@ fn playlist_file_name(base62: &str) -> String {
 }
 
 /// Records raw API responses of a live run to disk, keyed by request.
+#[derive(Clone)]
 pub struct CaptureStore {
     dir: PathBuf,
 }
@@ -68,6 +69,7 @@ impl CaptureStore {
 
 /// Serves previously captured (and anonymized) responses from a fixture
 /// directory, through the same parsing path as live runs.
+#[derive(Clone)]
 pub struct MockStore {
     dir: PathBuf,
 }

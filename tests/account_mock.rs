@@ -14,6 +14,7 @@ use spotify_dl::account::fetch_account_data;
 use spotify_dl::capture::MockStore;
 use spotify_dl::capture::ROOTLIST_PAGE_SIZE;
 use spotify_dl::folder_picker::FolderPicker;
+use spotify_dl::folder_picker::LoadingProgress;
 use spotify_dl::folder_picker::RowKind;
 
 fn fixtures_dir() -> PathBuf {
@@ -45,7 +46,8 @@ fn collect_recursive(folder: &Folder, out: &mut Vec<String>) {
 #[tokio::test]
 async fn builds_tree_and_names_from_mock_account() {
     let source = AccountSource::mock(fixtures_dir());
-    let (root, names) = fetch_account_data(&source, true)
+    let progress = LoadingProgress::default();
+    let (root, names) = fetch_account_data(&source, &progress)
         .await
         .expect("fetching account data from mock fixtures");
 
@@ -119,7 +121,8 @@ async fn mock_pagination_serves_captured_pages_then_stops() {
 #[tokio::test]
 async fn picker_selects_whole_folder_from_mock_tree() {
     let source = AccountSource::mock(fixtures_dir());
-    let (root, names) = fetch_account_data(&source, true).await.unwrap();
+    let progress = LoadingProgress::default();
+    let (root, names) = fetch_account_data(&source, &progress).await.unwrap();
 
     let mut picker = FolderPicker::new(&root, names);
     assert!(picker.row_count() > 0);
@@ -145,7 +148,8 @@ async fn picker_selects_whole_folder_from_mock_tree() {
 #[tokio::test]
 async fn picker_pre_selects_saved_playlists_from_mock_tree() {
     let source = AccountSource::mock(fixtures_dir());
-    let (root, names) = fetch_account_data(&source, true).await.unwrap();
+    let progress = LoadingProgress::default();
+    let (root, names) = fetch_account_data(&source, &progress).await.unwrap();
 
     let mut tree_uris = Vec::new();
     collect_tree_uris(&root, &mut tree_uris);

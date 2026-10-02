@@ -168,12 +168,20 @@ async fn main() -> anyhow::Result<()> {
         result
     });
 
+    let tui_ui = ui.clone();
     let tui_task = tokio::task::spawn_blocking(move || {
-        download_ui::run_tui(ui.clone(), rate_limiter, finished_rx)
+        download_ui::run_tui(tui_ui, rate_limiter, finished_rx)
     });
 
     let (download_result, tui_result) = tokio::join!(download_task, tui_task);
     tui_result.map_err(|err| anyhow::anyhow!("download view crashed: {err}"))??;
+
+    // The summary is printed after the view closes, so the terminal shows
+    // more than just the logs from before it opened.
+    let summary = ui.summary();
+    println!("\n{summary}");
+    tracing::info!("{summary}");
+
     download_result.map_err(|err| anyhow::anyhow!("download task crashed: {err}"))??;
 
     // Record the downloaded status once the run has finished, so the picker

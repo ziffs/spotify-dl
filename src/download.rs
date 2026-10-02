@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use librespot::core::SpotifyUri;
 use librespot::core::session::Session;
 
 use crate::download_ui::DownloadUi;
@@ -16,6 +17,17 @@ use crate::stream::StreamEvent;
 use crate::stream::StreamEventChannel;
 use crate::track::Track;
 use crate::track::TrackMetadata;
+
+/// The result of processing a single song.
+enum TrackOutcome {
+    /// The file was written by this run; carries the relative path and the
+    /// size on disk.
+    Downloaded { path: String, bytes: u64 },
+    /// The file already existed; carries the relative path.
+    Skipped { path: String },
+    /// Nothing on disk (streaming or processing failure; already logged).
+    Failed,
+}
 
 pub struct Downloader {
     session: Session,
@@ -71,7 +83,7 @@ impl Downloader {
             tracing::info!("Rate limiting enabled: at most 30 downloads per 30 minutes");
         }
 
-        let mut seen: HashSet<librespot::core::SpotifyUri> = HashSet::new();
+        let mut seen: HashSet<SpotifyUri> = HashSet::new();
         let mut playlist_files: Vec<(String, Vec<String>)> = Vec::new();
         for track in tracks.into_iter() {
             if ui.is_aborted() {
@@ -86,15 +98,25 @@ impl Downloader {
             }
 
             ui.track_started(&track);
-            let filename = match self.download_track(&track, options, ui).await {
+            let outcome = match self.download_track(&track, options, ui).await {
+                Ok(outcome) => outcome,
                 Err(err) => {
                     tracing::warn!("Error in track {:?}: {:?}", track.id, err);
-                    continue;
+                    TrackOutcome::Failed
                 }
-                Ok(filename) if filename.is_empty() => continue,
-                Ok(filename) => filename,
             };
-            ui.track_completed(&track.id);
+
+            let path = match &outcome {
+                TrackOutcome::Downloaded { path, .. } | TrackOutcome::Skipped { path } => path,
+                TrackOutcome::Failed => continue,
+            };
+            match outcome {
+                TrackOutcome::Downloaded { bytes, .. } => {
+                    ui.track_completed(&track.id, true, bytes)
+                }
+                TrackOutcome::Skipped { .. } => ui.track_completed(&track.id, false, 0),
+                TrackOutcome::Failed => continue,
+            };
 
             for playlist in ui.playlists_of(&track.id) {
                 let index = match playlist_files
@@ -107,7 +129,7 @@ impl Downloader {
                         playlist_files.len() - 1
                     }
                 };
-                playlist_files[index].1.push(filename.clone());
+                playlist_files[index].1.push(path.clone());
 
                 Self::write_playlist_file(
                     &options.destination,
@@ -115,6 +137,7 @@ impl Downloader {
                     &playlist_files[index].1,
                 )
                 .await?;
+                ui.playlist_synced(&playlist);
             }
         }
         ui.finish();
@@ -151,7 +174,7 @@ impl Downloader {
         track: &Track,
         options: &DownloadOptions,
         ui: &DownloadUi,
-    ) -> Result<String> {
+    ) -> Result<TrackOutcome> {
         let metadata = track.metadata(&self.session).await?;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
         ui.track_metadata(metadata.to_string(), metadata.approx_size() as u64);
@@ -173,7 +196,9 @@ impl Downloader {
                 "Skipping {}, file already exists. Use --force to force re-downloading the track",
                 &metadata.track_name
             );
-            return Ok(relative_path);
+            return Ok(TrackOutcome::Skipped {
+                path: relative_path,
+            });
         }
 
         // Only actual downloads are rate limited, not metadata requests or
@@ -189,7 +214,7 @@ impl Downloader {
             Ok(channel) => channel,
             Err(e) => {
                 tracing::error!("Failed to download {}: {}", metadata.to_string(), e);
-                return Ok("".to_string());
+                return Ok(TrackOutcome::Failed);
             }
         };
 
@@ -197,7 +222,7 @@ impl Downloader {
             Ok(samples) => samples,
             Err(e) => {
                 tracing::error!("Failed to download {}: {}", metadata.to_string(), e);
-                return Ok("".to_string());
+                return Ok(TrackOutcome::Failed);
             }
         };
 
@@ -214,9 +239,14 @@ impl Downloader {
         stream.write_to_file(&path).await?;
 
         let tags = metadata.tags().await?;
+        // The size on disk is read before the path is consumed by the tag writer.
+        let bytes = tokio::fs::metadata(&path).await?.len();
         encoder::tags::store_tags(path, &tags, options.format).await?;
 
-        Ok(relative_path)
+        Ok(TrackOutcome::Downloaded {
+            path: relative_path,
+            bytes,
+        })
     }
 
     async fn buffer_track(

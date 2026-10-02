@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -75,6 +76,67 @@ struct State {
     current_playlist: Option<usize>,
     aborted: bool,
     finished: bool,
+    /// Songs written to disk by this run.
+    downloaded_new: usize,
+    /// Songs that were already on disk and got skipped.
+    skipped: usize,
+    /// Size on disk of the songs written by this run.
+    new_bytes: u64,
+    /// Playlists whose file was written by this run.
+    playlists_synced: HashSet<String>,
+}
+
+/// What a finished (or aborted) download run produced.
+#[derive(Debug, Clone)]
+pub struct DownloadSummary {
+    /// Playlists whose file was written by this run.
+    pub playlists_synced: usize,
+    /// Unique songs in the run.
+    pub titles_total: usize,
+    /// Songs written to disk by this run.
+    pub downloaded: usize,
+    /// Songs that were already on disk and got skipped.
+    pub skipped: usize,
+    /// Songs that could not be downloaded.
+    pub failed: usize,
+    /// Size on disk of the songs written by this run.
+    pub new_bytes: u64,
+}
+
+impl fmt::Display for DownloadSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Synced {} playlist{}, {} title(s) total, {} downloaded",
+            self.playlists_synced,
+            if self.playlists_synced == 1 { "" } else { "s" },
+            self.titles_total,
+            self.downloaded,
+        )?;
+        if self.skipped > 0 {
+            write!(f, ", {} already on disk", self.skipped)?;
+        }
+        if self.failed > 0 {
+            write!(f, ", {} failed", self.failed)?;
+        }
+        write!(f, ", {} new on disk", format_bytes(self.new_bytes))
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Shared handle between the download loop and the download TUI.
@@ -177,20 +239,46 @@ impl DownloadUi {
         });
     }
 
-    /// The song finished (downloaded, or already on disk). Every playlist that
-    /// contains it gets its percentage updated.
-    pub fn track_completed(&self, id: &SpotifyUri) {
+    /// The song finished. `downloaded` tells whether it was written by this
+    /// run (`bytes` is its size on disk) or was already on disk and got
+    /// skipped. Every playlist that contains it gets its percentage updated.
+    pub fn track_completed(&self, id: &SpotifyUri, downloaded: bool, bytes: u64) {
         self.with_state(|state| {
-            if state.completed.insert(id.clone())
-                && let Some(indices) = state.track_playlists.get(id)
-            {
-                for &index in indices {
-                    state.playlists[index].done += 1;
+            if state.completed.insert(id.clone()) {
+                if let Some(indices) = state.track_playlists.get(id) {
+                    for &index in indices {
+                        state.playlists[index].done += 1;
+                    }
+                }
+                if downloaded {
+                    state.downloaded_new += 1;
+                    state.new_bytes += bytes;
+                } else {
+                    state.skipped += 1;
                 }
             }
             state.current = None;
             state.current_playlist = None;
         });
+    }
+
+    /// Records that the playlist's file was written by this run.
+    pub fn playlist_synced(&self, name: &str) {
+        self.with_state(|state| {
+            state.playlists_synced.insert(name.to_string());
+        });
+    }
+
+    /// The outcome of the run so far.
+    pub fn summary(&self) -> DownloadSummary {
+        self.with_state(|state| DownloadSummary {
+            playlists_synced: state.playlists_synced.len(),
+            titles_total: state.total_unique,
+            downloaded: state.downloaded_new,
+            skipped: state.skipped,
+            failed: state.total_unique - state.completed.len(),
+            new_bytes: state.new_bytes,
+        })
     }
 
     /// The download run finished (successfully or not).
@@ -477,7 +565,7 @@ mod tests {
         ui.track_started(&tracks[0]);
         ui.track_metadata("Song A".to_string(), 1024);
         ui.track_bytes(512);
-        ui.track_completed(&tracks[0].id);
+        ui.track_completed(&tracks[0].id, true, 2048);
 
         ui.with_state(|state| {
             // Both playlists containing "aaa" advanced at once.
@@ -490,8 +578,8 @@ mod tests {
             assert_eq!(state.playlists[1].total, 2);
         });
 
-        ui.track_completed(&tracks[1].id);
-        ui.track_completed(&tracks[3].id);
+        ui.track_completed(&tracks[1].id, true, 4096);
+        ui.track_completed(&tracks[3].id, false, 0);
         ui.with_state(|state| {
             assert_eq!(state.playlists[0].done, 2);
             assert_eq!(state.playlists[1].done, 2);
@@ -503,6 +591,32 @@ mod tests {
     }
 
     #[test]
+    fn summary_counts_downloads_skips_and_bytes() {
+        let tracks = vec![
+            track("aaa", Some("A")),
+            track("bbb", Some("A")),
+            track("ccc", None),
+        ];
+        let ui = DownloadUi::new(&tracks);
+        ui.playlist_synced("A");
+        ui.track_completed(&tracks[0].id, true, 1024 * 1024);
+        ui.track_completed(&tracks[1].id, false, 0);
+        // "ccc" failed: never completed.
+
+        let summary = ui.summary();
+        assert_eq!(summary.playlists_synced, 1);
+        assert_eq!(summary.titles_total, 3);
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.new_bytes, 1024 * 1024);
+        assert_eq!(
+            summary.to_string(),
+            "Synced 1 playlist, 3 title(s) total, 1 downloaded, 1 already on disk, 1 failed, 1.0 MB new on disk"
+        );
+    }
+
+    #[test]
     fn duplicate_entries_in_one_playlist_count_once() {
         let tracks = vec![
             track("aaa", Some("A")),
@@ -510,7 +624,7 @@ mod tests {
             track("bbb", Some("A")),
         ];
         let ui = DownloadUi::new(&tracks);
-        ui.track_completed(&tracks[0].id);
+        ui.track_completed(&tracks[0].id, true, 0);
         ui.with_state(|state| {
             assert_eq!(state.playlists[0].total, 2);
             assert_eq!(state.playlists[0].done, 1);
@@ -536,7 +650,7 @@ mod tests {
             track("ccc", Some("Beta")),
         ];
         let ui = DownloadUi::new(&tracks);
-        ui.track_completed(&tracks[0].id);
+        ui.track_completed(&tracks[0].id, true, 0);
         ui.track_started(&tracks[1]);
         ui.track_metadata("Song B".to_string(), 3 * 1024 * 1024);
         ui.track_bytes(1024 * 1024);
