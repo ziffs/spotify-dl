@@ -69,6 +69,8 @@ Every run is also logged to `~/.spotify-dl/spotify-dl.log` — debug detail for 
 
 During the download, a full-screen view shows the log output, every playlist with its completion percentage on the right, an overall progress bar and the remaining rate-limit budget. Songs that appear in several playlists advance all of their playlists at once, and `Ctrl-C` stops the run gracefully after the current song — the selection stays saved, so re-running `--from-account` and pressing Enter continues where you left off (files already on disk are skipped). When the run finishes, a summary is printed: playlists synced, titles total, how many were downloaded or already on disk, and the new size on disk.
 
+Songs Spotify reports as unavailable are not retried and are not silently lost: they are recorded as `#FAILED: …` comments (with the error and the path the file would have had) in every playlist file that contains them, and `~/.spotify-dl/unavailable.json` keeps a list of all unavailable tracks (name, error, last seen) that is updated on every encounter.
+
 ## 📁 Output structure
 
 Tracks are saved as `Artist/Album/Title.ext` under the destination folder (default: current directory), where `ext` is the selected format (`flac` or `mp3`):

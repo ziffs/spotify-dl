@@ -7,10 +7,15 @@ use librespot::playback::config::{Bitrate, PlayerConfig};
 use librespot::playback::mixer::NoOpVolume;
 use librespot::playback::player::{Player, PlayerEvent};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::sleep;
 
 use crate::stream::channel_sink::{ChannelSink, SinkEvent};
 use crate::stream::{StreamError, StreamEvent, StreamEventChannel};
 use crate::track::Track;
+
+/// How often a track load is attempted before giving up. Unavailable tracks
+/// are never retried (see `load`).
+const MAX_LOAD_ATTEMPTS: usize = 3;
 
 pub struct Stream {
     player_config: PlayerConfig,
@@ -43,45 +48,45 @@ impl Stream {
 
         let track = track.clone();
         tokio::spawn(async move {
-            match tryhard::retry_fn(|| async { Self::load(player.clone(), &track).await })
-                .retries(3)
-                .on_retry(|attempt, _, e| {
-                    let error = format!("{}", e);
-                    let tx = tx.clone();
-                    let track_id = track.id.clone();
-                    async move {
+            let mut attempt = 0usize;
+            loop {
+                attempt += 1;
+                match Self::load(player.clone(), &track).await {
+                    Ok(()) => {
+                        tracing::info!("Track loaded successfully: {:?}", track.id);
+                        break;
+                    }
+                    Err(err @ StreamError::Unavailable(_)) => {
+                        // Unavailable tracks do not come back during a run,
+                        // so there is nothing to retry.
+                        tracing::warn!("{}: {}", err, track.id);
+                        Self::send_event(&tx, StreamEvent::Error(err)).await;
+                        return;
+                    }
+                    Err(err) if attempt >= MAX_LOAD_ATTEMPTS => {
+                        tracing::error!("Failed to load track: {:?}, error: {:?}", track.id, err);
+                        Self::send_event(&tx, StreamEvent::Error(err)).await;
+                        return;
+                    }
+                    Err(err) => {
                         tracing::warn!(
-                            "Attempt {} to load track {:?} failed: {}",
+                            "Attempt {} of {} to load track {:?} failed: {} — retrying",
                             attempt,
-                            track_id,
-                            error
+                            MAX_LOAD_ATTEMPTS,
+                            track.id,
+                            err
                         );
                         Self::send_event(
                             &tx,
                             StreamEvent::Retry {
-                                attempt: attempt as usize,
-                                max_attempts: 3,
+                                attempt,
+                                max_attempts: MAX_LOAD_ATTEMPTS,
                             },
                         )
                         .await;
+                        let delay = Duration::from_secs(10).saturating_mul(attempt as u32);
+                        sleep(delay.min(Duration::from_secs(30))).await;
                     }
-                })
-                .exponential_backoff(Duration::from_secs(10))
-                .max_delay(Duration::from_secs(30))
-                .await
-            {
-                Ok(_) => tracing::info!("Track loaded successfully: {:?}", track.id),
-                Err(e) => {
-                    tracing::error!("Failed to load track: {:?}, error: {:?}", track.id, e);
-                    Self::send_event(
-                        &tx,
-                        StreamEvent::Error(StreamError::LoadError(format!(
-                            "Failed to load track: {:?}",
-                            track.id
-                        ))),
-                    )
-                    .await;
-                    return;
                 }
             }
 
@@ -115,7 +120,7 @@ impl Stream {
         Ok(rx)
     }
 
-    async fn load(player: Arc<Player>, track: &Track) -> Result<()> {
+    async fn load(player: Arc<Player>, track: &Track) -> Result<(), StreamError> {
         player.load(track.id.clone(), true, 0);
 
         tracing::info!("Loading track: {:?}", track.id);
@@ -129,7 +134,10 @@ impl Stream {
                 }
                 Some(PlayerEvent::Unavailable { .. }) => {
                     tracing::info!("Track is unavailable: {:?}", track.id);
-                    return Err(anyhow::anyhow!("Could not load track: {:?}", track.id));
+                    return Err(StreamError::Unavailable(format!(
+                        "Could not load track: {}",
+                        track.id
+                    )));
                 }
                 _ => {
                     // Ignore other events

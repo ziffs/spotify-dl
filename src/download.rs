@@ -13,10 +13,18 @@ use crate::encoder::Format;
 use crate::encoder::Samples;
 use crate::rate_limit::PersistentRateLimiter;
 use crate::stream::Stream;
+use crate::stream::StreamError;
 use crate::stream::StreamEvent;
 use crate::stream::StreamEventChannel;
 use crate::track::Track;
 use crate::track::TrackMetadata;
+
+/// A failure while streaming a song, with enough context for the playlist
+/// comment and the unavailable-tracks file.
+struct TrackFailure {
+    error: String,
+    unavailable: bool,
+}
 
 /// The result of processing a single song.
 enum TrackOutcome {
@@ -25,8 +33,17 @@ enum TrackOutcome {
     Downloaded { path: String, bytes: u64 },
     /// The file already existed; carries the relative path.
     Skipped { path: String },
-    /// Nothing on disk (streaming or processing failure; already logged).
-    Failed,
+    /// Nothing on disk; the song is recorded as a comment in the playlist
+    /// files that contain it.
+    Failed {
+        error: String,
+        /// Display name of the song, when its metadata was known.
+        name: Option<String>,
+        /// Where the song would have been saved, when its metadata was known.
+        path: Option<String>,
+        /// Spotify reported the song as unavailable (never retried).
+        unavailable: bool,
+    },
 }
 
 pub struct Downloader {
@@ -102,20 +119,44 @@ impl Downloader {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     tracing::warn!("Error in track {:?}: {:?}", track.id, err);
-                    TrackOutcome::Failed
+                    TrackOutcome::Failed {
+                        error: format!("{err:#}"),
+                        name: None,
+                        path: None,
+                        unavailable: false,
+                    }
                 }
             };
 
-            let path = match &outcome {
-                TrackOutcome::Downloaded { path, .. } | TrackOutcome::Skipped { path } => path,
-                TrackOutcome::Failed => continue,
-            };
-            match outcome {
+            match &outcome {
                 TrackOutcome::Downloaded { bytes, .. } => {
-                    ui.track_completed(&track.id, true, bytes)
+                    ui.track_completed(&track.id, true, *bytes)
                 }
                 TrackOutcome::Skipped { .. } => ui.track_completed(&track.id, false, 0),
-                TrackOutcome::Failed => continue,
+                TrackOutcome::Failed {
+                    error,
+                    name,
+                    unavailable,
+                    ..
+                } => {
+                    if *unavailable
+                        && let Err(err) =
+                            crate::unavailable::record(&track.id, name.as_deref(), error)
+                    {
+                        tracing::warn!("Could not update the unavailable tracks file: {err:#}");
+                    }
+                }
+            }
+
+            // The playlist entry for this song: its path, or a comment that
+            // keeps failed songs visible instead of silently dropping them.
+            let m3u_entry = match &outcome {
+                TrackOutcome::Downloaded { path, .. } | TrackOutcome::Skipped { path } => {
+                    path.clone()
+                }
+                TrackOutcome::Failed { error, path, .. } => {
+                    Self::failed_m3u_entry(error, path.as_deref(), &track.id)
+                }
             };
 
             for playlist in ui.playlists_of(&track.id) {
@@ -129,7 +170,7 @@ impl Downloader {
                         playlist_files.len() - 1
                     }
                 };
-                playlist_files[index].1.push(path.clone());
+                playlist_files[index].1.push(m3u_entry.clone());
 
                 Self::write_playlist_file(
                     &options.destination,
@@ -212,41 +253,85 @@ impl Downloader {
         let stream = Stream::new(self.session.clone());
         let channel = match stream.stream(track).await {
             Ok(channel) => channel,
-            Err(e) => {
-                tracing::error!("Failed to download {}: {}", metadata.to_string(), e);
-                return Ok(TrackOutcome::Failed);
+            Err(err) => {
+                tracing::error!("Failed to download {}: {}", metadata.to_string(), err);
+                return Ok(TrackOutcome::Failed {
+                    error: format!("could not start streaming: {err:#}"),
+                    name: Some(metadata.to_string()),
+                    path: Some(relative_path),
+                    unavailable: false,
+                });
             }
         };
 
         let samples = match self.buffer_track(channel, ui, &metadata).await {
             Ok(samples) => samples,
-            Err(e) => {
-                tracing::error!("Failed to download {}: {}", metadata.to_string(), e);
-                return Ok(TrackOutcome::Failed);
+            Err(failure) => {
+                tracing::error!(
+                    "Failed to download {}: {}",
+                    metadata.to_string(),
+                    failure.error
+                );
+                return Ok(TrackOutcome::Failed {
+                    error: failure.error,
+                    name: Some(metadata.to_string()),
+                    path: Some(relative_path),
+                    unavailable: failure.unavailable,
+                });
             }
         };
 
         tracing::info!("Encoding track: {}", metadata.to_string());
 
         let encoder = crate::encoder::get_encoder(options.format);
-        let stream = encoder.encode(samples).await?;
+        let encoded = match encoder.encode(samples).await {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                return Ok(TrackOutcome::Failed {
+                    error: format!("{err:#}"),
+                    name: Some(metadata.to_string()),
+                    path: Some(relative_path),
+                    unavailable: false,
+                });
+            }
+        };
 
         tracing::info!(
             "Writing track: {:?} to file: {}",
             metadata.to_string(),
             &path
         );
-        stream.write_to_file(&path).await?;
+        let written: Result<u64> = async {
+            encoded.write_to_file(&path).await?;
 
-        let tags = metadata.tags().await?;
-        // The size on disk is read before the path is consumed by the tag writer.
-        let bytes = tokio::fs::metadata(&path).await?.len();
-        encoder::tags::store_tags(path, &tags, options.format).await?;
+            let tags = metadata.tags().await?;
+            // The size on disk is read before the path is consumed by the tag writer.
+            let bytes = tokio::fs::metadata(&path).await?.len();
+            encoder::tags::store_tags(path, &tags, options.format).await?;
+            Ok(bytes)
+        }
+        .await;
 
-        Ok(TrackOutcome::Downloaded {
-            path: relative_path,
-            bytes,
-        })
+        match written {
+            Ok(bytes) => Ok(TrackOutcome::Downloaded {
+                path: relative_path,
+                bytes,
+            }),
+            Err(err) => Ok(TrackOutcome::Failed {
+                error: format!("{err:#}"),
+                name: Some(metadata.to_string()),
+                path: Some(relative_path),
+                unavailable: false,
+            }),
+        }
+    }
+
+    /// The M3U comment that keeps a failed song visible in its playlist.
+    fn failed_m3u_entry(error: &str, path: Option<&str>, id: &SpotifyUri) -> String {
+        match path {
+            Some(path) => format!("#FAILED: {error} — would have been saved as \"{path}\""),
+            None => format!("#FAILED: {error} — track {id}"),
+        }
     }
 
     async fn buffer_track(
@@ -254,7 +339,7 @@ impl Downloader {
         mut rx: StreamEventChannel,
         ui: &DownloadUi,
         metadata: &TrackMetadata,
-    ) -> Result<Samples> {
+    ) -> Result<Samples, TrackFailure> {
         let mut samples = Vec::<i32>::new();
         while let Some(event) = rx.recv().await {
             match event {
@@ -273,7 +358,16 @@ impl Downloader {
                 }
                 StreamEvent::Error(stream_error) => {
                     tracing::error!("Error while streaming track: {:?}", stream_error);
-                    return Err(anyhow::anyhow!("Streaming error: {:?}", stream_error));
+                    return Err(match stream_error {
+                        StreamError::Unavailable(message) => TrackFailure {
+                            error: message,
+                            unavailable: true,
+                        },
+                        other => TrackFailure {
+                            error: other.to_string(),
+                            unavailable: false,
+                        },
+                    });
                 }
                 StreamEvent::Retry {
                     attempt,
@@ -292,5 +386,36 @@ impl Downloader {
             samples,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track_id() -> SpotifyUri {
+        SpotifyUri::from_uri("spotify:track:0000000000000000000000").unwrap()
+    }
+
+    #[test]
+    fn failed_m3u_entry_with_known_path_mentions_the_file() {
+        let entry = Downloader::failed_m3u_entry(
+            "Track is unavailable",
+            Some("Artist/Album/Song.mp3"),
+            &track_id(),
+        );
+        assert_eq!(
+            entry,
+            "#FAILED: Track is unavailable — would have been saved as \"Artist/Album/Song.mp3\""
+        );
+    }
+
+    #[test]
+    fn failed_m3u_entry_without_metadata_falls_back_to_the_id() {
+        let entry = Downloader::failed_m3u_entry("Track is unavailable", None, &track_id());
+        assert_eq!(
+            entry,
+            "#FAILED: Track is unavailable — track spotify:track:0000000000000000000000"
+        );
     }
 }

@@ -20,6 +20,9 @@ pub enum StreamEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
+    #[error("{0}")]
+    Unavailable(String),
+
     #[error("Failed to load track: {0}")]
     LoadError(String),
 
