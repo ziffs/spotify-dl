@@ -65,6 +65,8 @@ Alternatively, pass `--from-account` (instead of any track arguments) to browse 
 
 The picker keeps its state in `~/.spotify-dl/account_state.json`: your selection is saved continuously and pre-selected on the next start, playlists already downloaded are marked with a ✓, and the folder tree and playlist names are cached so the picker also opens when Spotify cannot be reached. The initial metadata load runs in the background and its progress (playlists, then playlist names) is shown inside the picker; press `R` at any time to refresh the metadata from your account.
 
+Every run is also logged to `~/.spotify-dl/spotify-dl.log` — debug detail for spotify-dl itself, info from the libraries it drives, panics included. The file rotates at 5 MB and keeps one backup generation (`spotify-dl.log.1`), so runs can be analyzed afterwards.
+
 During the download, a full-screen view shows the log output, every playlist with its completion percentage on the right, an overall progress bar and the remaining rate-limit budget. Songs that appear in several playlists advance all of their playlists at once, and `Ctrl-C` stops the run gracefully after the current song — the selection stays saved, so re-running `--from-account` and pressing Enter continues where you left off (files already on disk are skipped). When the run finishes, a summary is printed: playlists synced, titles total, how many were downloaded or already on disk, and the new size on disk.
 
 ## 📁 Output structure

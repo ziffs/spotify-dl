@@ -75,6 +75,17 @@ async fn main() -> anyhow::Result<()> {
 
     let opt = Opt::from_args();
 
+    tracing::info!(
+        "spotify-dl {} starting — destination: {:?}, format: {:?}, force: {}, rate limit: {}, from-account: {}, mock: {:?}",
+        env!("CARGO_PKG_VERSION"),
+        opt.destination,
+        opt.format,
+        opt.force,
+        !opt.no_rate_limit,
+        opt.from_account,
+        std::env::var_os("SPOTIFY_DL_MOCK_DIR"),
+    );
+
     let dot_path = get_dot_path()?;
     let _instance_lock = match InstanceLock::acquire(dot_path.join("spotify-dl.lock")) {
         Ok(lock) => lock,
