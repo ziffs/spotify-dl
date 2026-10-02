@@ -11,6 +11,8 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
@@ -30,6 +32,35 @@ use crate::utils::get_dot_path;
 static LOG_GUARD: OnceCell<WorkerGuard> = OnceCell::new();
 
 const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
+
+/// The log file name for a run, timestamped with the current UTC date/time
+/// (`:` is avoided so the name is valid on every platform).
+fn log_file_name(now_epoch_secs: u64) -> String {
+    let (year, month, day) = civil_from_days((now_epoch_secs / 86_400) as i64);
+    let secs_of_day = now_epoch_secs % 86_400;
+    let (hour, minute, second) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+    format!("spotify-dl-{year:04}-{month:02}-{day:02}_{hour:02}-{minute:02}-{second:02}.log")
+}
+
+/// Converts days since 1970-01-01 to a proleptic Gregorian civil date
+/// (Howard Hinnant's `civil_from_days` algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
 
 /// In-memory ring buffer of formatted log lines, rendered by the TUIs.
 static MEMORY_LOG: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
@@ -132,7 +163,12 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 pub fn configure_logger() -> Result<()> {
-    let path = get_dot_path()?.join("spotify-dl.log");
+    // Every run writes its own log file, timestamped with the start time.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| anyhow::anyhow!("System clock error: {err}"))?
+        .as_secs();
+    let path = get_dot_path()?.join(log_file_name(now));
 
     let writer = RotatingFileWriter::new(path)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(writer);
@@ -291,5 +327,23 @@ mod tests {
         assert!(fs::metadata(&backup).unwrap().len() >= MAX_LOG_SIZE);
         let current = fs::metadata(&path).unwrap().len();
         assert!(current < MAX_LOG_SIZE, "the current chunk must be fresh");
+    }
+
+    #[test]
+    fn log_file_name_is_timestamped() {
+        assert_eq!(log_file_name(0), "spotify-dl-1970-01-01_00-00-00.log");
+        assert_eq!(log_file_name(86_400), "spotify-dl-1970-01-02_00-00-00.log");
+        assert_eq!(
+            log_file_name(86_400 + 3_600 + 60 + 1),
+            "spotify-dl-1970-01-02_01-01-01.log"
+        );
+    }
+
+    #[test]
+    fn civil_from_days_handles_leap_years() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(59), (1970, 3, 1));
+        // 1972 is a leap year: Feb 29 is day 789 after the epoch.
+        assert_eq!(civil_from_days(789), (1972, 2, 29));
     }
 }
