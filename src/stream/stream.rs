@@ -30,7 +30,7 @@ impl Stream {
     }
 
     pub async fn stream(&self, track: &Track) -> Result<StreamEventChannel> {
-        let metadata = track.metadata(&self.session).await?;
+        let metadata = track.metadata(&self.session).await;
         let (sink, mut channel) = ChannelSink::new(metadata);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 

@@ -175,7 +175,7 @@ impl Downloader {
         options: &DownloadOptions,
         ui: &DownloadUi,
     ) -> Result<TrackOutcome> {
-        let metadata = track.metadata(&self.session).await?;
+        let metadata = track.metadata(&self.session).await;
         tracing::info!("Downloading track: {:?}", metadata.track_name);
         ui.track_metadata(metadata.to_string(), metadata.approx_size() as u64);
 

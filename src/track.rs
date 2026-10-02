@@ -125,23 +125,46 @@ impl Track {
         }
     }
 
-    pub async fn metadata(&self, session: &Session) -> Result<TrackMetadata> {
+    pub async fn metadata(&self, session: &Session) -> TrackMetadata {
         let metadata = librespot::metadata::Track::get(session, &self.id)
             .await
-            .map_err(|_| anyhow::anyhow!("Failed to get metadata"))?;
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to get metadata for track {:?}: {e:?}", self.id);
+                panic!("Failed to get metadata for track {:?}", self.id);
+            });
 
         let mut artists = Vec::new();
         for artist in metadata.artists.iter() {
             artists.push(
                 librespot::metadata::Artist::get(session, &artist.id)
                     .await
-                    .map_err(|_| anyhow::anyhow!("Failed to get artist"))?,
+                    .unwrap_or_else(|e| {
+                        tracing::error!(
+                            "Failed to get artist {:?} for track {:?}: {e:?}",
+                            artist.id,
+                            self.id
+                        );
+                        panic!(
+                            "Failed to get artist {:?} for track {:?}",
+                            artist.id, self.id
+                        );
+                    }),
             );
         }
 
         let album = librespot::metadata::Album::get(session, &metadata.album.id)
             .await
-            .map_err(|_| anyhow::anyhow!("Failed to get album"))?;
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    "Failed to get album {:?} for track {:?}: {e:?}",
+                    metadata.album.id,
+                    self.id
+                );
+                panic!(
+                    "Failed to get album {:?} for track {:?}",
+                    metadata.album.id, self.id
+                );
+            });
 
         let covers = album.covers.clone();
         let session = session.clone();
@@ -156,12 +179,7 @@ impl Track {
             })
         });
 
-        Ok(TrackMetadata::from(
-            metadata,
-            artists,
-            album,
-            image_retriever,
-        ))
+        TrackMetadata::from(metadata, artists, album, image_retriever)
     }
 }
 
