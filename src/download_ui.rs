@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -17,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -41,12 +44,37 @@ use ratatui::widgets::ListItem;
 use ratatui::widgets::ListState;
 use ratatui::widgets::Paragraph;
 
+use crate::local_match::LocalTrackInfo;
 use crate::log;
 use crate::rate_limit::PersistentRateLimiter;
 use crate::track::Track;
 
-/// How often the download TUI redraws and polls for Ctrl-C.
+/// How often the download TUI redraws and polls for keys.
 const TICK: Duration = Duration::from_millis(200);
+
+/// A question the download loop asks the user through the TUI.
+#[derive(Debug, Clone)]
+pub enum PendingQuestion {
+    /// Pick the folder that contains the local files.
+    SelectFolder,
+    /// Confirm which local file corresponds to a `spotify:local:` entry.
+    MatchTrack {
+        info: LocalTrackInfo,
+        playlist: Option<String>,
+        candidates: Vec<PathBuf>,
+    },
+}
+
+/// The user's answer to a pending question.
+#[derive(Debug)]
+pub enum PendingAnswer {
+    /// The folder chosen for local file matching.
+    Folder(PathBuf),
+    /// The user declined to pick a folder; local files are skipped this run.
+    Declined,
+    /// The confirmed candidate file, or none when the user skips.
+    Match(Option<PathBuf>),
+}
 
 #[derive(Debug)]
 struct PlaylistProgress {
@@ -84,6 +112,11 @@ struct State {
     new_bytes: u64,
     /// Playlists whose file was written by this run.
     playlists_synced: HashSet<String>,
+    /// The question currently shown to the user, if any.
+    pending_question: Option<PendingQuestion>,
+    /// How many questions were asked and answered so far.
+    questions_total: usize,
+    questions_answered: usize,
 }
 
 /// What a finished (or aborted) download run produced.
@@ -144,13 +177,20 @@ fn format_bytes(bytes: u64) -> String {
 pub struct DownloadUi {
     state: Arc<Mutex<State>>,
     abort: Arc<AtomicBool>,
+    /// Answers from the TUI, consumed by the download loop.
+    local_answers: Arc<tokio::sync::Mutex<tokio_mpsc::Receiver<PendingAnswer>>>,
+    local_answer_tx: tokio_mpsc::Sender<PendingAnswer>,
 }
 
 impl DownloadUi {
     /// Builds the progress model from the track entries that are about to be
     /// downloaded. A song appearing in several playlists counts once per
     /// playlist, and once overall.
-    pub fn new(tracks: &[Track]) -> Self {
+    pub fn new(
+        tracks: &[Track],
+        local_answer_tx: tokio_mpsc::Sender<PendingAnswer>,
+        local_answers: tokio_mpsc::Receiver<PendingAnswer>,
+    ) -> Self {
         let mut state = State::default();
         let mut playlist_index: HashMap<String, usize> = HashMap::new();
         let mut counted: HashSet<(usize, SpotifyUri)> = HashSet::new();
@@ -183,6 +223,8 @@ impl DownloadUi {
         Self {
             state: Arc::new(Mutex::new(state)),
             abort: Arc::new(AtomicBool::new(false)),
+            local_answers: Arc::new(tokio::sync::Mutex::new(local_answers)),
+            local_answer_tx,
         }
     }
 
@@ -304,6 +346,47 @@ impl DownloadUi {
                 .unwrap_or_default()
         })
     }
+
+    /// Shows a question in the TUI; the download loop then waits for the
+    /// answer with [`recv_local_answer`](Self::recv_local_answer).
+    pub fn push_question(&self, question: PendingQuestion) {
+        self.with_state(|state| {
+            state.pending_question = Some(question);
+            state.questions_total += 1;
+        });
+    }
+
+    /// The question currently shown to the user, if any.
+    pub fn current_question(&self) -> Option<PendingQuestion> {
+        self.with_state(|state| state.pending_question.clone())
+    }
+
+    /// How many questions were answered and asked so far.
+    pub fn question_progress(&self) -> (usize, usize) {
+        self.with_state(|state| (state.questions_answered, state.questions_total))
+    }
+
+    /// Waits for the user's answer to the pending question.
+    pub async fn recv_local_answer(&self) -> Option<PendingAnswer> {
+        self.local_answers.lock().await.recv().await
+    }
+
+    /// Sends the user's answer from the TUI thread and clears the question.
+    pub fn send_local_answer(&self, answer: PendingAnswer) {
+        match self.local_answer_tx.try_send(answer) {
+            Ok(()) => {}
+            // The download loop is gone; nothing is waiting for the answer.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            Err(err) => {
+                tracing::warn!("Could not send the answer: {err}");
+                return;
+            }
+        }
+        self.with_state(|state| {
+            state.pending_question = None;
+            state.questions_answered += 1;
+        });
+    }
 }
 
 /// Renders the download TUI until the download task finishes.
@@ -337,23 +420,79 @@ fn tui_loop(
     };
 
     let mut list_state = ListState::default();
+    let mut question_cursor = 0usize;
+    let mut browser: Option<BrowserState> = None;
     let result = loop {
-        if let Err(err) =
-            terminal.draw(|frame| draw(frame, &ui, rate_limiter.as_deref(), &mut list_state))
-        {
+        let question = ui.current_question();
+        if matches!(question, Some(PendingQuestion::SelectFolder)) && browser.is_none() {
+            browser = Some(BrowserState::at_home());
+        }
+        if question.is_none() {
+            browser = None;
+        }
+
+        if let Err(err) = terminal.draw(|frame| {
+            draw(
+                frame,
+                &ui,
+                rate_limiter.as_deref(),
+                &mut list_state,
+                question.as_ref(),
+                question_cursor,
+                browser.as_ref(),
+            )
+        }) {
             break Err(anyhow!("download view failed: {err}"));
         }
 
-        // Ctrl-C requests a graceful abort; other keys are ignored. A failing
-        // event poll (no controlling terminal) is not fatal.
+        // Ctrl-C requests a graceful abort (waking the download loop, which
+        // may be waiting for an answer); while a question is pending the keys
+        // drive the question instead. A failing event poll (no controlling
+        // terminal) is not fatal.
         match crossterm_event::poll(TICK) {
             Ok(true) => {
                 if let Event::Key(key) = crossterm_event::read()?
                     && key.kind == KeyEventKind::Press
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')
                 {
-                    ui.abort();
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if let Some(question) = &question {
+                            ui.send_local_answer(skip_answer(question));
+                        }
+                        ui.abort();
+                    } else if let Some(question) = &question {
+                        match key.code {
+                            KeyCode::Up => question_cursor = question_cursor.saturating_sub(1),
+                            KeyCode::Down => {
+                                let len = question_list_len(question, browser.as_ref());
+                                question_cursor = (question_cursor + 1).min(len.saturating_sub(1));
+                            }
+                            KeyCode::Enter => match question {
+                                PendingQuestion::SelectFolder => {
+                                    // Enter opens the highlighted directory;
+                                    // 's' selects the current one.
+                                    if let Some(next) = browser
+                                        .as_ref()
+                                        .and_then(|browser| browser.descend(question_cursor))
+                                    {
+                                        browser = Some(next);
+                                    }
+                                }
+                                PendingQuestion::MatchTrack { candidates, .. } => {
+                                    ui.send_local_answer(PendingAnswer::Match(
+                                        candidates.get(question_cursor).cloned(),
+                                    ));
+                                    question_cursor = 0;
+                                }
+                            },
+                            KeyCode::Esc | KeyCode::Char('s') => {
+                                ui.send_local_answer(skip_answer(question));
+                                question_cursor = 0;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             Ok(false) => {}
@@ -370,11 +509,71 @@ fn tui_loop(
     result
 }
 
+/// The answer that skips the pending question.
+fn skip_answer(question: &PendingQuestion) -> PendingAnswer {
+    match question {
+        PendingQuestion::SelectFolder => PendingAnswer::Declined,
+        PendingQuestion::MatchTrack { .. } => PendingAnswer::Match(None),
+    }
+}
+
+/// The number of selectable entries of the pending question.
+fn question_list_len(question: &PendingQuestion, browser: Option<&BrowserState>) -> usize {
+    match question {
+        PendingQuestion::SelectFolder => browser.map(|browser| browser.dirs.len() + 1).unwrap_or(1),
+        PendingQuestion::MatchTrack { candidates, .. } => candidates.len(),
+    }
+}
+
+/// The folder browser shown while the user picks the local-files folder.
+struct BrowserState {
+    cwd: PathBuf,
+    dirs: Vec<PathBuf>,
+}
+
+impl BrowserState {
+    fn at_home() -> Self {
+        let cwd = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::load(cwd)
+    }
+
+    fn load(cwd: PathBuf) -> Self {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(&cwd)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort();
+        Self { cwd, dirs }
+    }
+
+    /// Enters the entry at `cursor`: 0 is the parent directory, the rest are
+    /// the subdirectories of the current one.
+    fn descend(&self, cursor: usize) -> Option<Self> {
+        let target = if cursor == 0 {
+            self.cwd.parent().map(|parent| parent.to_path_buf())?
+        } else {
+            self.dirs.get(cursor - 1)?.clone()
+        };
+        Some(Self::load(target))
+    }
+}
+
 fn draw(
     frame: &mut Frame,
     ui: &DownloadUi,
     rate_limiter: Option<&PersistentRateLimiter>,
     list_state: &mut ListState,
+    question: Option<&PendingQuestion>,
+    question_cursor: usize,
+    browser: Option<&BrowserState>,
 ) {
     let area = frame.area();
     let rate_status = rate_limiter.map(|limiter| limiter.status());
@@ -400,15 +599,39 @@ fn draw(
         }
         let chunks = Layout::vertical(constraints).split(area);
 
-        let log_height = chunks[0].height.saturating_sub(2) as usize;
+        // While a question is pending, the log shares its row with the
+        // questioning pane on the right.
+        let (log_area, question_area) = match question {
+            Some(question) => {
+                let panes =
+                    Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                        .split(chunks[0]);
+                (panes[0], Some((panes[1], question)))
+            }
+            None => (chunks[0], None),
+        };
+
+        let log_height = log_area.height.saturating_sub(2) as usize;
         let lines: Vec<Line> = log::recent_lines(log_height)
             .into_iter()
             .map(Line::raw)
             .collect();
         frame.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Log")),
-            chunks[0],
+            log_area,
         );
+
+        if let Some((area, question)) = question_area {
+            draw_question(
+                frame,
+                area,
+                question,
+                question_cursor,
+                browser,
+                state.questions_answered,
+                state.questions_total,
+            );
+        }
 
         let mut next = 1;
         if list_height > 0 {
@@ -478,6 +701,125 @@ fn draw(
             frame.render_widget(gauge, chunks[next]);
         }
     });
+}
+
+/// The questioning pane shown on the right while a question is pending.
+fn draw_question(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    question: &PendingQuestion,
+    cursor: usize,
+    browser: Option<&BrowserState>,
+    answered: usize,
+    total: usize,
+) {
+    let title = match question {
+        PendingQuestion::SelectFolder => "Select the folder with your local files".to_string(),
+        PendingQuestion::MatchTrack { .. } => format!("Local files ({answered}/{total})"),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    match question {
+        PendingQuestion::SelectFolder => {
+            let browser = browser.expect("browser state for the folder question");
+            let rows = Layout::vertical([
+                Constraint::Length(1), // current path
+                Constraint::Min(1),    // directories
+                Constraint::Length(1), // hints
+                Constraint::Length(1), // gauge
+            ])
+            .split(inner);
+
+            frame.render_widget(
+                Paragraph::new(format!("Searching in: {}", browser.cwd.display())),
+                rows[0],
+            );
+
+            let mut items = vec![ListItem::new("..")];
+            items.extend(browser.dirs.iter().map(|dir| {
+                ListItem::new(
+                    dir.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| dir.display().to_string()),
+                )
+            }));
+            let mut state = ListState::default().with_selected(Some(cursor.min(items.len() - 1)));
+            frame.render_stateful_widget(
+                List::new(items).block(Block::default()),
+                rows[1],
+                &mut state,
+            );
+
+            frame.render_widget(
+                Paragraph::new(
+                    "↑/↓ move · enter open · s select this folder · esc skip local files",
+                ),
+                rows[2],
+            );
+            frame.render_widget(question_gauge(answered, total), rows[3]);
+        }
+        PendingQuestion::MatchTrack {
+            info,
+            playlist,
+            candidates,
+        } => {
+            let rows = Layout::vertical([
+                Constraint::Length(1), // song
+                Constraint::Length(1), // playlist
+                Constraint::Min(1),    // candidates
+                Constraint::Length(1), // hints
+                Constraint::Length(1), // gauge
+            ])
+            .split(inner);
+
+            frame.render_widget(Paragraph::new(info.display()), rows[0]);
+            if let Some(playlist) = playlist {
+                frame.render_widget(
+                    Paragraph::new(format!("from playlist: {playlist}")),
+                    rows[1],
+                );
+            }
+
+            if candidates.is_empty() {
+                frame.render_widget(
+                    Paragraph::new("No matching files found — esc to skip"),
+                    rows[2],
+                );
+            } else {
+                let items: Vec<ListItem> = candidates
+                    .iter()
+                    .map(|candidate| {
+                        ListItem::new(truncate(
+                            &candidate.file_name().unwrap_or_default().to_string_lossy(),
+                            inner.width.saturating_sub(2) as usize,
+                        ))
+                    })
+                    .collect();
+                let mut state =
+                    ListState::default().with_selected(Some(cursor.min(items.len() - 1)));
+                frame.render_stateful_widget(
+                    List::new(items).block(Block::default()),
+                    rows[2],
+                    &mut state,
+                );
+            }
+
+            frame.render_widget(
+                Paragraph::new("↑/↓ move · enter confirm · esc skip"),
+                rows[3],
+            );
+            frame.render_widget(question_gauge(answered, total), rows[4]);
+        }
+    }
+}
+
+fn question_gauge(answered: usize, total: usize) -> Gauge<'static> {
+    Gauge::default()
+        .ratio(ratio(answered, total))
+        .label(format!("{answered}/{total} answered"))
+        .gauge_style(Style::default().fg(Color::Green))
 }
 
 fn playlist_line(playlist: &PlaylistProgress, width: usize) -> ListItem<'static> {
@@ -560,7 +902,8 @@ mod tests {
             track("aaa", Some("B")),
             track("ccc", Some("B")),
         ];
-        let ui = DownloadUi::new(&tracks);
+        let (answer_tx, answer_rx) = tokio_mpsc::channel(4);
+        let ui = DownloadUi::new(&tracks, answer_tx, answer_rx);
 
         ui.track_started(&tracks[0]);
         ui.track_metadata("Song A".to_string(), 1024);
@@ -597,7 +940,8 @@ mod tests {
             track("bbb", Some("A")),
             track("ccc", None),
         ];
-        let ui = DownloadUi::new(&tracks);
+        let (answer_tx, answer_rx) = tokio_mpsc::channel(4);
+        let ui = DownloadUi::new(&tracks, answer_tx, answer_rx);
         ui.playlist_synced("A");
         ui.track_completed(&tracks[0].id, true, 1024 * 1024);
         ui.track_completed(&tracks[1].id, false, 0);
@@ -623,7 +967,8 @@ mod tests {
             track("aaa", Some("A")),
             track("bbb", Some("A")),
         ];
-        let ui = DownloadUi::new(&tracks);
+        let (answer_tx, answer_rx) = tokio_mpsc::channel(4);
+        let ui = DownloadUi::new(&tracks, answer_tx, answer_rx);
         ui.track_completed(&tracks[0].id, true, 0);
         ui.with_state(|state| {
             assert_eq!(state.playlists[0].total, 2);
@@ -634,12 +979,59 @@ mod tests {
     #[test]
     fn abort_and_finish_flags() {
         let tracks = vec![track("aaa", None)];
-        let ui = DownloadUi::new(&tracks);
+        let (answer_tx, answer_rx) = tokio_mpsc::channel(4);
+        let ui = DownloadUi::new(&tracks, answer_tx, answer_rx);
         assert!(!ui.is_aborted());
         ui.abort();
         assert!(ui.is_aborted());
         ui.finish();
         ui.with_state(|state| assert!(state.finished));
+    }
+
+    #[tokio::test]
+    async fn questions_are_answered_one_by_one() {
+        let tracks = vec![track("aaa", Some("A"))];
+        let (answer_tx, answer_rx) = tokio_mpsc::channel(4);
+        let ui = DownloadUi::new(&tracks, answer_tx, answer_rx);
+
+        assert!(ui.current_question().is_none());
+        ui.push_question(PendingQuestion::SelectFolder);
+        assert!(matches!(
+            ui.current_question(),
+            Some(PendingQuestion::SelectFolder)
+        ));
+        assert_eq!(ui.question_progress(), (0, 1));
+
+        // The answer arrives on the channel the download loop consumes.
+        ui.send_local_answer(PendingAnswer::Folder(PathBuf::from("/tmp/music")));
+        match ui.recv_local_answer().await {
+            Some(PendingAnswer::Folder(path)) => {
+                assert_eq!(path, PathBuf::from("/tmp/music"));
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert!(ui.current_question().is_none());
+        assert_eq!(ui.question_progress(), (1, 1));
+
+        // A track question with candidates.
+        ui.push_question(PendingQuestion::MatchTrack {
+            info: LocalTrackInfo {
+                artist: "OSIVE x THNK PNK".to_string(),
+                title: "CHOP SUEY (EDIT)".to_string(),
+            },
+            playlist: Some("A".to_string()),
+            candidates: vec![PathBuf::from("/tmp/music/song.mp3")],
+        });
+        ui.send_local_answer(PendingAnswer::Match(Some(PathBuf::from(
+            "/tmp/music/song.mp3",
+        ))));
+        match ui.recv_local_answer().await {
+            Some(PendingAnswer::Match(Some(path))) => {
+                assert_eq!(path, PathBuf::from("/tmp/music/song.mp3"));
+            }
+            other => panic!("unexpected answer: {other:?}"),
+        }
+        assert_eq!(ui.question_progress(), (2, 2));
     }
 
     #[test]
@@ -649,7 +1041,8 @@ mod tests {
             track("bbb", Some("Alpha")),
             track("ccc", Some("Beta")),
         ];
-        let ui = DownloadUi::new(&tracks);
+        let (answer_tx, answer_rx) = tokio_mpsc::channel(4);
+        let ui = DownloadUi::new(&tracks, answer_tx, answer_rx);
         ui.track_completed(&tracks[0].id, true, 0);
         ui.track_started(&tracks[1]);
         ui.track_metadata("Song B".to_string(), 3 * 1024 * 1024);
@@ -657,7 +1050,9 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &ui, None, &mut ListState::default()))
+            .draw(|frame| {
+                draw(frame, &ui, None, &mut ListState::default(), None, 0, None)
+            })
             .unwrap();
         let content = buffer_content(terminal.backend().buffer());
 
@@ -671,7 +1066,8 @@ mod tests {
     #[test]
     fn renders_rate_limit_bar() {
         let tracks = vec![track("aaa", None)];
-        let ui = DownloadUi::new(&tracks);
+        let (answer_tx, answer_rx) = tokio_mpsc::channel(4);
+        let ui = DownloadUi::new(&tracks, answer_tx, answer_rx);
         ui.finish();
 
         let limiter = PersistentRateLimiter::new(
@@ -686,7 +1082,17 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(70, 10)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &ui, Some(&limiter), &mut ListState::default()))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &ui,
+                    Some(&limiter),
+                    &mut ListState::default(),
+                    None,
+                    0,
+                    None,
+                )
+            })
             .unwrap();
         let content = buffer_content(terminal.backend().buffer());
         assert!(content.contains("Rate limit 10/10"));

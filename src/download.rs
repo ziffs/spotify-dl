@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,7 +8,10 @@ use anyhow::Result;
 use librespot::core::SpotifyUri;
 use librespot::core::session::Session;
 
+use crate::account_state::AccountState;
 use crate::download_ui::DownloadUi;
+use crate::download_ui::PendingAnswer;
+use crate::download_ui::PendingQuestion;
 use crate::encoder;
 use crate::encoder::Format;
 use crate::encoder::Samples;
@@ -44,6 +48,56 @@ enum TrackOutcome {
         /// Spotify reported the song as unavailable (never retried).
         unavailable: bool,
     },
+}
+
+/// State of the `spotify:local:` matching for one download run.
+struct LocalMatching {
+    /// The folder the user chose (or that was saved in the config).
+    folder: Option<PathBuf>,
+    /// The user declined to pick a folder; local entries are skipped.
+    declined: bool,
+    /// Confirmed matches from the config and this run, by track URI.
+    matches: HashMap<String, PathBuf>,
+}
+
+impl LocalMatching {
+    fn from_config() -> Self {
+        let state = AccountState::load();
+        let folder = state
+            .as_ref()
+            .and_then(|state| state.local_folder.clone())
+            .map(PathBuf::from)
+            .filter(|folder| folder.is_dir());
+        let matches = state
+            .map(|state| state.local_matches)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(uri, path)| (uri, PathBuf::from(path)))
+            .collect();
+        Self {
+            folder,
+            declined: false,
+            matches,
+        }
+    }
+
+    fn save_folder(folder: &Path) {
+        let mut state = AccountState::load().unwrap_or_default();
+        state.local_folder = Some(folder.display().to_string());
+        if let Err(err) = state.save() {
+            tracing::warn!("Could not save the local files folder: {err:#}");
+        }
+    }
+
+    fn save_match(uri: &str, path: &Path) {
+        let mut state = AccountState::load().unwrap_or_default();
+        state
+            .local_matches
+            .insert(uri.to_string(), path.display().to_string());
+        if let Err(err) = state.save() {
+            tracing::warn!("Could not save the local file match: {err:#}");
+        }
+    }
 }
 
 pub struct Downloader {
@@ -102,6 +156,7 @@ impl Downloader {
 
         let mut seen: HashSet<SpotifyUri> = HashSet::new();
         let mut playlist_files: Vec<(String, Vec<String>)> = Vec::new();
+        let mut local = LocalMatching::from_config();
         for track in tracks.into_iter() {
             if ui.is_aborted() {
                 ui.finish();
@@ -111,6 +166,14 @@ impl Downloader {
             // it is downloaded once and every playlist containing it is
             // updated when it finishes.
             if !seen.insert(track.id.clone()) {
+                continue;
+            }
+
+            // Local playlist entries cannot be downloaded from Spotify; they
+            // are matched against files on disk instead.
+            if crate::local_match::is_local(&track.id) {
+                self.resolve_local_track(&track, options, ui, &mut local, &mut playlist_files)
+                    .await?;
                 continue;
             }
 
@@ -159,29 +222,118 @@ impl Downloader {
                 }
             };
 
-            for playlist in ui.playlists_of(&track.id) {
-                let index = match playlist_files
-                    .iter()
-                    .position(|(name, _)| name == &playlist)
-                {
-                    Some(index) => index,
-                    None => {
-                        playlist_files.push((playlist.clone(), Vec::new()));
-                        playlist_files.len() - 1
-                    }
-                };
-                playlist_files[index].1.push(m3u_entry.clone());
-
-                Self::write_playlist_file(
-                    &options.destination,
-                    &playlist,
-                    &playlist_files[index].1,
-                )
-                .await?;
-                ui.playlist_synced(&playlist);
-            }
+            Self::append_to_playlists(
+                &mut playlist_files,
+                &ui.playlists_of(&track.id),
+                &m3u_entry,
+                options,
+                ui,
+            )
+            .await?;
         }
         ui.finish();
+        Ok(())
+    }
+
+    /// Appends an entry to the playlist files of the given playlists and
+    /// rewrites them.
+    async fn append_to_playlists(
+        playlist_files: &mut Vec<(String, Vec<String>)>,
+        playlists: &[String],
+        entry: &str,
+        options: &DownloadOptions,
+        ui: &DownloadUi,
+    ) -> Result<()> {
+        for playlist in playlists {
+            let index = match playlist_files.iter().position(|(name, _)| name == playlist) {
+                Some(index) => index,
+                None => {
+                    playlist_files.push((playlist.clone(), Vec::new()));
+                    playlist_files.len() - 1
+                }
+            };
+            playlist_files[index].1.push(entry.to_string());
+
+            Self::write_playlist_file(&options.destination, playlist, &playlist_files[index].1)
+                .await?;
+            ui.playlist_synced(playlist);
+        }
+        Ok(())
+    }
+
+    /// Resolves a `spotify:local:` entry: a saved match that still exists is
+    /// reused, otherwise the user is asked — first for the folder to search
+    /// (once, saved to the config), then for each song, one by one, while the
+    /// rest of the download continues.
+    async fn resolve_local_track(
+        &self,
+        track: &Track,
+        options: &DownloadOptions,
+        ui: &DownloadUi,
+        local: &mut LocalMatching,
+        playlist_files: &mut Vec<(String, Vec<String>)>,
+    ) -> Result<()> {
+        let playlists = ui.playlists_of(&track.id);
+
+        let Some(info) = crate::local_match::parse_local(&track.id) else {
+            let entry = Self::failed_m3u_entry("unparseable local track", None, &track.id);
+            Self::append_to_playlists(playlist_files, &playlists, &entry, options, ui).await?;
+            return Ok(());
+        };
+
+        // A saved match that still exists is reused without asking.
+        if let Some(path) = local
+            .matches
+            .get(&track.id.to_string())
+            .filter(|path| path.exists())
+        {
+            let entry = path.to_string_lossy().to_string();
+            ui.track_completed(&track.id, false, 0);
+            Self::append_to_playlists(playlist_files, &playlists, &entry, options, ui).await?;
+            return Ok(());
+        }
+
+        // Ask for the folder to search once, when none is configured.
+        if local.folder.is_none() && !local.declined {
+            ui.push_question(PendingQuestion::SelectFolder);
+            match ui.recv_local_answer().await {
+                Some(PendingAnswer::Folder(path)) => {
+                    local.folder = Some(path.clone());
+                    LocalMatching::save_folder(&path);
+                }
+                _ => local.declined = true,
+            }
+        }
+
+        let candidates = match &local.folder {
+            Some(folder) => crate::local_match::find_candidates(folder, &info).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        ui.push_question(PendingQuestion::MatchTrack {
+            info: info.clone(),
+            playlist: track.source_playlist.clone(),
+            candidates,
+        });
+        let matched = match ui.recv_local_answer().await {
+            Some(PendingAnswer::Match(Some(path))) => {
+                LocalMatching::save_match(&track.id.to_string(), &path);
+                Some(path)
+            }
+            _ => None,
+        };
+
+        match matched {
+            Some(path) => {
+                let entry = path.to_string_lossy().to_string();
+                ui.track_completed(&track.id, false, 0);
+                Self::append_to_playlists(playlist_files, &playlists, &entry, options, ui).await?;
+            }
+            None => {
+                let entry = Self::failed_m3u_entry("no local file matched", None, &track.id);
+                Self::append_to_playlists(playlist_files, &playlists, &entry, options, ui).await?;
+            }
+        }
         Ok(())
     }
 
@@ -244,10 +396,10 @@ impl Downloader {
 
         // Only actual downloads are rate limited, not metadata requests or
         // tracks skipped because they already exist on disk.
-        if options.rate_limit {
-            if let Some(rate_limiter) = &options.rate_limiter {
-                rate_limiter.acquire().await?;
-            }
+        if options.rate_limit
+            && let Some(rate_limiter) = &options.rate_limiter
+        {
+            rate_limiter.acquire().await?;
         }
 
         let stream = Stream::new(self.session.clone());

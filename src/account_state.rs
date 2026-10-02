@@ -34,6 +34,12 @@ pub(crate) struct AccountState {
     /// Playlist URIs a download run has completed, by unix timestamp (seconds).
     #[serde(default)]
     pub(crate) downloaded: HashMap<String, u64>,
+    /// The folder the user chose for matching `spotify:local:` entries.
+    #[serde(default)]
+    pub(crate) local_folder: Option<String>,
+    /// Confirmed matches for `spotify:local:` entries, by track URI.
+    #[serde(default)]
+    pub(crate) local_matches: HashMap<String, String>,
 }
 
 impl AccountState {

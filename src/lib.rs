@@ -5,6 +5,7 @@ pub mod download;
 pub mod download_ui;
 pub mod encoder;
 pub mod folder_picker;
+pub mod local_match;
 pub mod lock;
 pub mod log;
 pub mod rate_limit;

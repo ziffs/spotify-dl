@@ -159,7 +159,8 @@ async fn main() -> anyhow::Result<()> {
 
     // The download runs as a task while a dedicated thread renders the
     // download view; the view exits when the task finishes.
-    let ui = download_ui::DownloadUi::new(&track);
+    let (local_answer_tx, local_answer_rx) = tokio::sync::mpsc::channel(4);
+    let ui = download_ui::DownloadUi::new(&track, local_answer_tx, local_answer_rx);
     let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
     let download_options = DownloadOptions::new(
         opt.destination,

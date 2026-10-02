@@ -71,6 +71,8 @@ During the download, a full-screen view shows the log output, every playlist wit
 
 Songs Spotify reports as unavailable are not retried and are not silently lost: they are recorded as `#FAILED: …` comments (with the error and the path the file would have had) in every playlist file that contains them, and `~/.spotify-dl/unavailable.json` keeps a list of all unavailable tracks (name, error, last seen) that is updated on every encounter.
 
+`spotify:local:` playlist entries (local files) cannot be downloaded from Spotify. Instead, the download view asks for the folder that contains your local files (a folder browser, saved to the config), searches it for matching files — first with an `Artist - Title*` glob, then with a fuzzier glob where special characters became wildcards — and lets you confirm the match for each entry, one by one, while the rest of the download continues. Confirmed matches are saved in the config and reused automatically in later runs; unmatched entries are recorded as `#FAILED: …` comments.
+
 ## 📁 Output structure
 
 Tracks are saved as `Artist/Album/Title.ext` under the destination folder (default: current directory), where `ext` is the selected format (`flac` or `mp3`):
