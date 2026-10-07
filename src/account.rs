@@ -191,13 +191,10 @@ pub async fn select_folder_playlists(source: &AccountSource) -> Result<Vec<Strin
             state.save()?;
 
             println!(
-                "Downloading {} playlist{}:",
+                "Downloading {} playlist{}.",
                 selected.len(),
                 if selected.len() == 1 { "" } else { "s" }
             );
-            for playlist in &selected {
-                println!("  - {playlist}");
-            }
 
             Ok(selected)
         }

@@ -26,7 +26,7 @@ trait TrackCollection {
 pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<Vec<Track>> {
     let mut tracks: Vec<Track> = Vec::new();
     for id in spotify_ids {
-        tracing::debug!("Getting tracks for: {}", id);
+        tracing::info!("Getting tracks for: {}", id);
         let id = parse_uri_or_url(&id).ok_or(anyhow::anyhow!("Invalid track"))?;
         let new_tracks = match &id {
             SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => {
@@ -41,7 +41,7 @@ pub async fn get_tracks(spotify_ids: Vec<String>, session: &Session) -> Result<V
         };
         tracks.extend(new_tracks);
     }
-    tracing::debug!("Got tracks: {:?}", tracks);
+    tracing::info!("Found {} tracks total.", tracks.len());
     Ok(tracks)
 }
 
@@ -70,7 +70,8 @@ fn parse_uri(track_uri: &str) -> Option<SpotifyUri> {
         },
         _ => return None,
     };
-    tracing::info!("Parsed URI: {:?}", uri);
+    tracing::debug!("Parsed URI: {:?}", uri);
+
     Some(uri)
 }
 

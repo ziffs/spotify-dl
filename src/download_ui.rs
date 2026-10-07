@@ -792,7 +792,9 @@ fn draw_question(
                     .iter()
                     .map(|candidate| {
                         ListItem::new(truncate(
-                            &candidate.file_name().unwrap_or_default().to_string_lossy(),
+                            format!("{}/{}",
+                                &candidate.parent().unwrap_or_default().to_string_lossy(),
+                                &candidate.file_name().unwrap_or_default().to_string_lossy()),
                             inner.width.saturating_sub(2) as usize,
                         ))
                     })

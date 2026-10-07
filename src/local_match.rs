@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use itertools::Itertools;
 
 use anyhow::Result;
 use librespot::core::SpotifyUri;
@@ -90,6 +91,7 @@ fn fuzzy_glob(text: &str) -> String {
     let wild: String = text
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '*' })
+        .dedup()
         .collect();
     format!("*{wild}*")
 }
@@ -100,26 +102,35 @@ fn fuzzy_glob(text: &str) -> String {
 pub(crate) fn find_candidates(folder: &Path, info: &LocalTrackInfo) -> Result<Vec<PathBuf>> {
     let mut candidates = Vec::new();
     // `<artist> - <title>*` — the display name is already "artist - title".
-    let primary = format!("{}*", info.display());
+    let pattern = format!("{}/**/{}*.*", folder.to_str().expect("local_folder must be a valid path"), info.display());
 
     let collect = |pattern: &str, candidates: &mut Vec<PathBuf>| -> Result<()> {
-        for entry in fs::read_dir(folder)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
+        let options = glob::MatchOptions{
+            case_sensitive: false, require_literal_leading_dot: false, require_literal_separator: true,
+        };
+        match glob::glob_with(pattern, options) {
+            Ok(matches) => {
+                candidates.extend(matches.map(|p|{
+                    match p {
+                        Ok(p) => Some(p.to_path_buf()),
+                        Err(e) => {
+                            tracing::warn!("Glob error for {}: {}", pattern, e);
+                            None
+                        },
+                    }
+                }).filter_map(|p| p));
+                Ok(())
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if glob_match(pattern, &name) {
-                candidates.push(path);
+            Err(e) => {
+                return Err(anyhow::anyhow!(e));
             }
         }
-        Ok(())
     };
 
-    collect(&primary, &mut candidates)?;
+    collect(&pattern, &mut candidates)?;
     if candidates.is_empty() {
-        collect(&fuzzy_glob(primary.trim_end_matches('*')), &mut candidates)?;
+        let pattern = format!("{:?}/**/{}.*", folder, fuzzy_glob(&info.display()));
+        collect(&pattern, &mut candidates)?;
     }
 
     candidates.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
